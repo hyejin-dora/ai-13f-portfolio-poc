@@ -1,7 +1,8 @@
 """AI 13F 포트폴리오 분석 PoC - 메인 화면.
 
-이번 단계에서는 SEC EDGAR에서 최근 13F-HR 공시 목록을 조회해 표로 보여줍니다.
-보유 종목 상세 분석과 Gemini API 설명 생성은 다음 단계에서 추가합니다.
+이번 단계에서는 SEC EDGAR에서 최근 13F-HR 공시 목록을 조회하고,
+그중 한 건을 골라 실제 보유 종목 목록과 포트폴리오 비중을 표로 보여줍니다.
+Gemini API 설명 생성은 다음 단계에서 추가합니다.
 
 화면(이 파일)은 사용자에게 보여주는 일만 하고,
 실제 데이터 수집은 services/sec_client.py가 담당합니다.
@@ -9,16 +10,33 @@
 
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
-from services.sec_client import SecApiError, get_recent_13f_filings
+from services.portfolio_analysis import (
+    STATUS_DECREASED,
+    STATUS_EXITED,
+    STATUS_INCREASED,
+    STATUS_NEW,
+    STATUS_UNCHANGED,
+    compare_holdings,
+    summarize_comparison,
+)
+from services.sec_client import (
+    SecApiError,
+    get_13f_holdings,
+    get_recent_13f_filings,
+)
 
 # 이번 단계의 분석 대상 운용사. data/managers.csv에서 이 이름으로 찾습니다.
 TARGET_MANAGER = "Berkshire Hathaway"
 
 # 조회할 공시 건수.
 FILING_LIMIT = 2
+
+# 비중 상위 몇 개 종목을 따로 보여줄지.
+TOP_HOLDINGS_COUNT = 10
 
 MANAGERS_CSV = Path(__file__).parent / "data" / "managers.csv"
 
@@ -29,6 +47,64 @@ COLUMN_LABELS = {
     "report_date": "기준일 (report_date)",
     "primary_document": "주요 문서 (primary_document)",
 }
+
+# 보유 종목 표의 열 순서. sec_client.get_13f_holdings가 돌려주는 키를 그대로 씁니다.
+HOLDINGS_COLUMNS = [
+    "issuer_name",
+    "class_title",
+    "cusip",
+    "value_thousands",
+    "shares",
+    "share_type",
+    "put_call",
+]
+
+# 숫자로 다뤄야 하는 열(합계와 비중 계산에 사용).
+NUMERIC_HOLDINGS_COLUMNS = ["value_thousands", "shares"]
+
+# 글자로 다뤄야 하는 열(값이 없으면 빈칸으로 표시).
+TEXT_HOLDINGS_COLUMNS = [
+    "issuer_name",
+    "class_title",
+    "cusip",
+    "share_type",
+    "put_call",
+]
+
+# 분기 비교 표에 보여 줄 열 순서. 사람이 읽기 쉽게 종목명을 앞에 둡니다.
+# (분석 결과 표의 열 이름은 그대로 쓰고, 순서만 바꿉니다.)
+COMPARISON_DISPLAY_COLUMNS = [
+    "issuer_name",
+    "class_title",
+    "cusip",
+    "previous_value_thousands",
+    "current_value_thousands",
+    "value_change_thousands",
+    "previous_shares",
+    "current_shares",
+    "shares_change",
+    "previous_weight",
+    "current_weight",
+    "weight_change_pct_point",
+    "change_status",
+]
+
+# 분기 비교 화면에서 탭으로 나눌 변화 구분 순서.
+CHANGE_STATUS_ORDER = [
+    STATUS_NEW,
+    STATUS_INCREASED,
+    STATUS_DECREASED,
+    STATUS_EXITED,
+    STATUS_UNCHANGED,
+]
+
+# 변화 차트에 보여 줄 종목 수(절대값 기준 비중 변화 상위).
+TOP_WEIGHT_CHANGE_COUNT = 10
+
+# 비중 변화 차트 색. 값이 커진 쪽과 작아진 쪽을 반대 색으로 나타내는 '발산형' 한 쌍이며,
+# 국내 관행에 맞춰 확대는 빨강, 축소는 파랑을 씁니다.
+COLOR_INCREASE = "#e34948"
+COLOR_DECREASE = "#2a78d6"
 
 
 @st.cache_data
@@ -69,6 +145,186 @@ def to_display_table(filings: list[dict]) -> pd.DataFrame:
     """조회 결과를 화면에 표시할 표 형태로 정리합니다."""
     table = pd.DataFrame(filings, columns=list(COLUMN_LABELS))
     return table.rename(columns=COLUMN_LABELS)
+
+
+def format_filing_label(filing: dict) -> str:
+    """selectbox에 보여 줄 공시 설명을 만듭니다.
+
+    사용자가 어떤 분기의 공시인지 알 수 있도록 제출일과 기준일을 함께 씁니다.
+    """
+    filing_date = filing.get("filing_date") or "제출일 미확인"
+    report_date = filing.get("report_date") or "기준일 미확인"
+    return f"제출일 {filing_date} · 기준일(분기 말) {report_date}"
+
+
+def build_holdings_table(holdings: list[dict]) -> pd.DataFrame:
+    """보유 종목 목록을 화면용 표로 정리합니다.
+
+    하는 일:
+        1) 정해진 열 순서로 표를 만듭니다.
+        2) 금액과 수량을 숫자로 바꿉니다(바꿀 수 없는 값은 빈칸 처리).
+        3) 각 종목의 평가금액을 전체 합계로 나눠 포트폴리오 비중(%)을 계산합니다.
+        4) 평가금액이 큰 종목부터 정렬합니다.
+
+    보유 종목이 없거나 금액이 비어 있어도 오류 없이 빈 표를 돌려줍니다.
+    """
+    table = pd.DataFrame(holdings, columns=HOLDINGS_COLUMNS)
+
+    for column in NUMERIC_HOLDINGS_COLUMNS:
+        # 숫자로 바꿀 수 없는 값은 빈 값(NaN)으로 두어 합계 계산에서 제외합니다.
+        table[column] = pd.to_numeric(table[column], errors="coerce")
+
+    for column in TEXT_HOLDINGS_COLUMNS:
+        table[column] = table[column].fillna("").astype(str)
+
+    total_value = sum_portfolio_value(table)
+    if total_value > 0:
+        table["portfolio_weight"] = table["value_thousands"] / total_value * 100
+    else:
+        # 금액이 모두 비어 있으면 비중을 계산할 수 없으므로 빈칸으로 둡니다.
+        table["portfolio_weight"] = pd.NA
+
+    sorted_table = table.sort_values(
+        "value_thousands", ascending=False, na_position="last"
+    )
+    return sorted_table.reset_index(drop=True)
+
+
+def sum_portfolio_value(table: pd.DataFrame) -> float:
+    """보유 종목 표의 공시 평가금액 합계를 돌려줍니다. 값이 없으면 0입니다."""
+    if table.empty:
+        return 0.0
+
+    total = table["value_thousands"].sum(skipna=True)
+    return float(total) if pd.notna(total) else 0.0
+
+
+def format_percent(value, digits: int = 2) -> str:
+    """비율을 부호가 붙은 문자열로 바꿉니다. 계산 불가한 값은 안내 문구로 바꿉니다."""
+    if value is None or pd.isna(value):
+        return "계산 불가"
+    return f"{value:+,.{digits}f}%"
+
+
+def comparison_column_config() -> dict:
+    """분기 비교 표의 숫자 표시 형식을 정합니다.
+
+    열 이름은 분석 결과 그대로 두고, 단위 설명은 도움말(?)과 캡션으로 알려 줍니다.
+    """
+    return {
+        "previous_value_thousands": st.column_config.NumberColumn(
+            help="이전 분기 공시 평가금액 (천 달러)", format="localized"
+        ),
+        "current_value_thousands": st.column_config.NumberColumn(
+            help="현재 분기 공시 평가금액 (천 달러)", format="localized"
+        ),
+        "value_change_thousands": st.column_config.NumberColumn(
+            help="공시 평가금액 증감 (천 달러)", format="localized"
+        ),
+        "previous_shares": st.column_config.NumberColumn(
+            help="이전 분기 보유수량", format="localized"
+        ),
+        "current_shares": st.column_config.NumberColumn(
+            help="현재 분기 보유수량", format="localized"
+        ),
+        "shares_change": st.column_config.NumberColumn(
+            help="보유수량 증감", format="localized"
+        ),
+        "previous_weight": st.column_config.NumberColumn(
+            help="이전 분기 포트폴리오 비중 (%)", format="%.2f%%"
+        ),
+        "current_weight": st.column_config.NumberColumn(
+            help="현재 분기 포트폴리오 비중 (%)", format="%.2f%%"
+        ),
+        "weight_change_pct_point": st.column_config.NumberColumn(
+            help="비중 변화 (%포인트)", format="%+.2f"
+        ),
+    }
+
+
+def top_weight_changes(comparison: pd.DataFrame) -> pd.DataFrame:
+    """비중 변화가 큰 상위 종목을 골라 차트용 표로 만듭니다.
+
+    '큰 변화'는 늘어난 쪽과 줄어든 쪽을 함께 보기 위해 절대값 기준으로 고릅니다.
+    그래서 신규 편입(크게 늘어남)과 전량 매도(크게 줄어듦)도 함께 나타납니다.
+    """
+    if comparison is None or comparison.empty:
+        return pd.DataFrame(
+            columns=["issuer_name", "weight_change_pct_point", "change_status", "변화 방향"]
+        )
+
+    table = comparison.copy()
+    table["절대 변화"] = table["weight_change_pct_point"].abs()
+
+    top = table.sort_values("절대 변화", ascending=False).head(TOP_WEIGHT_CHANGE_COUNT)
+    top = top[top["절대 변화"] > 0]
+
+    # 같은 이름이 겹치면 막대가 합쳐져 보이므로 CUSIP 뒷자리를 덧붙여 구분합니다.
+    labels = top["issuer_name"].where(top["issuer_name"] != "", top["cusip"])
+    if labels.duplicated().any():
+        labels = labels + " (" + top["cusip"].str[-4:] + ")"
+
+    return pd.DataFrame(
+        {
+            "issuer_name": labels,
+            "weight_change_pct_point": top["weight_change_pct_point"],
+            "change_status": top["change_status"],
+            "변화 방향": top["weight_change_pct_point"].apply(
+                lambda value: "비중 확대" if value > 0 else "비중 축소"
+            ),
+        }
+    )
+
+
+def weight_change_chart(chart_data: pd.DataFrame) -> alt.Chart:
+    """비중 변화 막대 차트를 만듭니다.
+
+    가로 막대로 그리고, 변화가 큰 종목을 위쪽에 둡니다.
+    0을 기준으로 오른쪽(확대)과 왼쪽(축소)을 서로 반대 색으로 표시합니다.
+    """
+    bars = (
+        alt.Chart(chart_data)
+        .mark_bar(cornerRadiusEnd=4, height=14)
+        .encode(
+            x=alt.X(
+                "weight_change_pct_point:Q",
+                title="비중 변화 (%포인트)",
+                axis=alt.Axis(format="+.2f"),
+            ),
+            y=alt.Y(
+                "issuer_name:N",
+                title=None,
+                sort=alt.EncodingSortField(
+                    field="weight_change_pct_point", order="descending"
+                ),
+            ),
+            color=alt.Color(
+                "변화 방향:N",
+                title=None,
+                scale=alt.Scale(
+                    domain=["비중 확대", "비중 축소"],
+                    range=[COLOR_INCREASE, COLOR_DECREASE],
+                ),
+                legend=alt.Legend(orient="top"),
+            ),
+            tooltip=[
+                alt.Tooltip("issuer_name:N", title="종목"),
+                alt.Tooltip("change_status:N", title="변화 구분"),
+                alt.Tooltip(
+                    "weight_change_pct_point:Q", title="비중 변화(%p)", format="+.2f"
+                ),
+            ],
+        )
+    )
+
+    # 0 기준선. 어디까지가 확대이고 축소인지 눈으로 바로 구분되게 합니다.
+    zero_line = (
+        alt.Chart(pd.DataFrame({"zero": [0]}))
+        .mark_rule(color="#8a8a85", strokeWidth=1)
+        .encode(x="zero:Q")
+    )
+
+    return (bars + zero_line).properties(height=alt.Step(26))
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +375,10 @@ if st.button("최근 13F 공시 조회", type="primary"):
     # 다른 버튼을 눌러 화면이 다시 그려져도 표가 사라지지 않게 하기 위함입니다.
     st.session_state["filings"] = None
     st.session_state["error"] = None
+    # 공시 목록을 새로 불러오면, 앞서 조회한 보유 종목 결과는 지웁니다.
+    st.session_state["holdings"] = None
+    st.session_state["holdings_error"] = None
+    st.session_state["holdings_filing"] = None
 
     try:
         # User-Agent는 여기서 읽어 조회 함수에 바로 넘깁니다. 화면에 표시하지 않습니다.
@@ -155,6 +415,324 @@ elif st.session_state.get("filings") is not None:
             f"{manager['name']}의 13F-HR 공시를 찾지 못했습니다. "
             "CIK가 올바른지 확인해 주세요."
         )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 보유 종목 조회
+# ---------------------------------------------------------------------------
+
+st.subheader("보유 종목 조회")
+st.caption(
+    "위에서 불러온 공시 중 하나를 골라, 그 공시에 담긴 실제 보유 종목 목록"
+    "(INFORMATION TABLE)을 조회합니다."
+)
+
+available_filings = st.session_state.get("filings") or []
+
+if not available_filings:
+    st.info("먼저 위의 '최근 13F 공시 조회' 버튼을 눌러 공시 목록을 불러와 주세요.")
+else:
+    selected_index = st.selectbox(
+        "조회할 공시를 선택하세요",
+        options=range(len(available_filings)),
+        format_func=lambda index: format_filing_label(available_filings[index]),
+        key="selected_filing_index",
+    )
+    selected_filing = available_filings[selected_index]
+
+    if st.button("보유 종목 조회", type="primary"):
+        st.session_state["holdings"] = None
+        st.session_state["holdings_error"] = None
+        st.session_state["holdings_filing"] = selected_filing
+
+        try:
+            # User-Agent는 여기서 읽어 조회 함수에만 넘깁니다. 화면에 표시하지 않습니다.
+            user_agent = read_sec_user_agent()
+
+            with st.spinner("SEC EDGAR에서 보유 종목 목록을 불러오는 중입니다..."):
+                st.session_state["holdings"] = get_13f_holdings(
+                    manager["cik"],
+                    selected_filing["accession_number"],
+                    user_agent=user_agent,
+                )
+        except LookupError as error:
+            # SEC_USER_AGENT 설정이 없는 경우.
+            st.session_state["holdings_error"] = str(error)
+        except (SecApiError, ValueError) as error:
+            # sec_client가 만들어 준 한국어 안내 메시지를 그대로 보여줍니다.
+            # (보유 종목 파일을 찾지 못한 경우도 여기에 포함됩니다.)
+            st.session_state["holdings_error"] = str(error)
+        except Exception:
+            # 예상하지 못한 오류. 내부 정보가 새지 않도록 상세 내용은 보여주지 않습니다.
+            st.session_state["holdings_error"] = (
+                "보유 종목을 불러오는 중 예상하지 못한 문제가 발생했습니다. "
+                "잠시 후 다시 시도해 주세요."
+            )
+
+if st.session_state.get("holdings_error"):
+    st.error(st.session_state["holdings_error"])
+elif st.session_state.get("holdings") is not None:
+    holdings = st.session_state["holdings"]
+    holdings_filing = st.session_state.get("holdings_filing") or {}
+
+    if not holdings:
+        st.warning(
+            "이 공시에서는 보유 종목을 찾지 못했습니다. "
+            "다른 공시를 선택해 다시 조회해 주세요."
+        )
+    else:
+        holdings_table = build_holdings_table(holdings)
+        total_value = sum_portfolio_value(holdings_table)
+
+        st.success(f"조회한 공시: {format_filing_label(holdings_filing)}")
+
+        # 1) 전체 보유 종목 수 / 2) 전체 공시 평가금액 합계
+        count_column, value_column = st.columns(2)
+        count_column.metric("전체 보유 종목 수", f"{len(holdings_table):,}개")
+        value_column.metric(
+            "전체 공시 평가금액 합계", f"{total_value:,.0f} 천 달러"
+        )
+        st.caption(
+            "공시 평가금액(value_thousands)의 단위는 SEC 13F 서식 기준 "
+            "**천 달러(=1,000달러)** 입니다. 예를 들어 1,000,000은 10억 달러를 뜻합니다. "
+            "다만 SEC는 2023년부터 이 칸을 달러 단위로 받고 있어, 최근 공시는 실제로 "
+            "달러 단위일 수 있으니 금액의 크기를 볼 때 참고해 주세요. "
+            "비중(%)은 같은 공시 안에서의 비율이라 단위와 관계없이 그대로 유효합니다."
+        )
+
+        # 3) 상위 10개 종목의 포트폴리오 비중
+        st.markdown(f"**상위 {TOP_HOLDINGS_COUNT}개 종목 비중**")
+        top_holdings = holdings_table.head(TOP_HOLDINGS_COUNT)[
+            ["issuer_name", "value_thousands", "portfolio_weight"]
+        ]
+        st.dataframe(
+            top_holdings,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "value_thousands": st.column_config.NumberColumn(format="localized"),
+                "portfolio_weight": st.column_config.ProgressColumn(
+                    help="전체 공시 평가금액 합계에서 이 종목이 차지하는 비율(%)",
+                    format="%.2f%%",
+                    min_value=0,
+                    max_value=100,
+                ),
+            },
+        )
+
+        # 4) 보유 종목 전체 표
+        st.markdown("**보유 종목 전체**")
+        st.dataframe(
+            holdings_table,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "value_thousands": st.column_config.NumberColumn(format="localized"),
+                "shares": st.column_config.NumberColumn(format="localized"),
+                "portfolio_weight": st.column_config.NumberColumn(
+                    help="전체 공시 평가금액 합계에서 이 종목이 차지하는 비율(%)",
+                    format="%.2f%%",
+                ),
+            },
+        )
+        st.caption(
+            "표는 공시 평가금액이 큰 종목부터 정렬했습니다. "
+            "put_call 칸은 옵션 관련 보유일 때만 값이 표시됩니다."
+        )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 최근 두 분기 포트폴리오 비교
+# ---------------------------------------------------------------------------
+
+st.subheader("최근 두 분기 포트폴리오 비교")
+st.caption(
+    "최근 13F-HR 공시 2건을 자동으로 불러와, 가장 최신 공시를 '현재 분기', "
+    "그 이전 공시를 '이전 분기'로 놓고 보유 종목의 변화를 비교합니다."
+)
+
+if st.button("두 분기 변화 분석", type="primary"):
+    st.session_state["comparison"] = None
+    st.session_state["comparison_summary"] = None
+    st.session_state["comparison_filings"] = None
+    st.session_state["comparison_error"] = None
+    st.session_state["comparison_warning"] = None
+
+    try:
+        # User-Agent는 여기서 읽어 조회 함수에만 넘깁니다. 화면에 표시하지 않습니다.
+        user_agent = read_sec_user_agent()
+
+        with st.spinner("SEC EDGAR에서 최근 공시 2건을 불러오는 중입니다..."):
+            recent_filings = get_recent_13f_filings(
+                manager["cik"],
+                user_agent=user_agent,
+                limit=FILING_LIMIT,
+            )
+
+        if len(recent_filings) < 2:
+            # 공시가 1건뿐이면 비교할 대상이 없습니다. 오류가 아니라 안내로 알립니다.
+            st.session_state["comparison_warning"] = (
+                f"{manager['name']}의 13F-HR 공시가 {len(recent_filings)}건만 조회되어 "
+                "두 분기를 비교할 수 없습니다."
+            )
+        else:
+            # 최신순으로 정렬된 목록이므로 첫 번째가 현재 분기, 두 번째가 이전 분기입니다.
+            current_filing = recent_filings[0]
+            previous_filing = recent_filings[1]
+
+            with st.spinner("현재 분기 보유 종목을 불러오는 중입니다..."):
+                current_holdings = get_13f_holdings(
+                    manager["cik"],
+                    current_filing["accession_number"],
+                    user_agent=user_agent,
+                )
+
+            with st.spinner("이전 분기 보유 종목을 불러오는 중입니다..."):
+                previous_holdings = get_13f_holdings(
+                    manager["cik"],
+                    previous_filing["accession_number"],
+                    user_agent=user_agent,
+                )
+
+            with st.spinner("두 분기의 변화를 분석하는 중입니다..."):
+                comparison_result = compare_holdings(
+                    previous_holdings, current_holdings
+                )
+                st.session_state["comparison"] = comparison_result
+                st.session_state["comparison_summary"] = summarize_comparison(
+                    comparison_result
+                )
+                st.session_state["comparison_filings"] = {
+                    "current": current_filing,
+                    "previous": previous_filing,
+                }
+    except LookupError as error:
+        # SEC_USER_AGENT 설정이 없는 경우.
+        st.session_state["comparison_error"] = str(error)
+    except (SecApiError, ValueError) as error:
+        # sec_client가 만들어 준 한국어 안내 메시지를 그대로 보여줍니다.
+        st.session_state["comparison_error"] = str(error)
+    except Exception:
+        # 예상하지 못한 오류. 내부 정보가 새지 않도록 상세 내용은 보여주지 않습니다.
+        st.session_state["comparison_error"] = (
+            "두 분기를 비교하는 중 예상하지 못한 문제가 발생했습니다. "
+            "잠시 후 다시 시도해 주세요."
+        )
+
+if st.session_state.get("comparison_error"):
+    st.error(st.session_state["comparison_error"])
+elif st.session_state.get("comparison_warning"):
+    st.warning(st.session_state["comparison_warning"])
+elif st.session_state.get("comparison") is not None:
+    comparison = st.session_state["comparison"]
+    summary = st.session_state["comparison_summary"] or {}
+    comparison_filings = st.session_state.get("comparison_filings") or {}
+    current_filing = comparison_filings.get("current") or {}
+    previous_filing = comparison_filings.get("previous") or {}
+
+    if comparison.empty:
+        st.warning(
+            "두 공시 모두에서 보유 종목을 찾지 못해 비교할 내용이 없습니다. "
+            "잠시 후 다시 시도해 주세요."
+        )
+    else:
+        # --- A. 비교 기준 ---------------------------------------------------
+        st.markdown("**비교 기준**")
+        current_column, previous_column = st.columns(2)
+        current_column.markdown(
+            f"현재 분기 (최신 공시)\n\n"
+            f"- 제출일(filing_date): `{current_filing.get('filing_date', '-')}`\n"
+            f"- 기준일(report_date): `{current_filing.get('report_date', '-')}`"
+        )
+        previous_column.markdown(
+            f"이전 분기\n\n"
+            f"- 제출일(filing_date): `{previous_filing.get('filing_date', '-')}`\n"
+            f"- 기준일(report_date): `{previous_filing.get('report_date', '-')}`"
+        )
+
+        # --- B. 요약 지표 ---------------------------------------------------
+        st.markdown("**요약 지표**")
+        value_columns = st.columns(3)
+        value_columns[0].metric(
+            "현재 분기 전체 평가금액 (천 달러)",
+            f"{summary.get('current_total_value', 0):,.0f}",
+        )
+        value_columns[1].metric(
+            "이전 분기 전체 평가금액 (천 달러)",
+            f"{summary.get('previous_total_value', 0):,.0f}",
+        )
+        value_columns[2].metric(
+            "전체 평가금액 증감률",
+            format_percent(summary.get("total_value_change_pct")),
+        )
+        st.caption(
+            "평가금액의 단위는 SEC 13F 서식 기준 **천 달러(=1,000달러)** 입니다. "
+            f"증감액은 {summary.get('total_value_change', 0):+,.0f} 천 달러입니다."
+        )
+
+        count_columns = st.columns(5)
+        count_columns[0].metric(
+            "신규 편입", f"{summary.get('new_position_count', 0)}개"
+        )
+        count_columns[1].metric(
+            "보유 확대", f"{summary.get('increased_position_count', 0)}개"
+        )
+        count_columns[2].metric(
+            "보유 축소", f"{summary.get('decreased_position_count', 0)}개"
+        )
+        count_columns[3].metric(
+            "전량 매도", f"{summary.get('exited_position_count', 0)}개"
+        )
+        count_columns[4].metric(
+            "유지", f"{summary.get('unchanged_position_count', 0)}개"
+        )
+
+        st.warning(
+            "13F의 평가금액 변화는 **주가 변화와 보유수량 변화가 함께 반영된 값**입니다. "
+            "따라서 실제 매수·매도 금액과 같지 않습니다. "
+            "실제로 사고팔았는지는 보유수량(shares) 변화를 함께 확인해 주세요."
+        )
+
+        # --- C. 종목 변화 표 ------------------------------------------------
+        st.markdown("**종목 변화 상세**")
+        st.caption(
+            "평가금액 관련 열의 단위는 천 달러, 비중(previous_weight, current_weight)은 %, "
+            "비중 변화(weight_change_pct_point)는 **%포인트**입니다."
+        )
+
+        status_counts = comparison["change_status"].value_counts()
+        tabs = st.tabs(
+            [f"{status} ({int(status_counts.get(status, 0))})" for status in CHANGE_STATUS_ORDER]
+        )
+
+        for tab, status in zip(tabs, CHANGE_STATUS_ORDER):
+            with tab:
+                rows = comparison[comparison["change_status"] == status]
+                if rows.empty:
+                    st.info("해당 종목이 없습니다.")
+                else:
+                    st.dataframe(
+                        rows[COMPARISON_DISPLAY_COLUMNS],
+                        hide_index=True,
+                        width="stretch",
+                        column_config=comparison_column_config(),
+                    )
+
+        # --- D. 변화 차트 ---------------------------------------------------
+        st.markdown(f"**비중 변화가 큰 상위 {TOP_WEIGHT_CHANGE_COUNT}개 종목**")
+        st.caption(
+            "늘어난 종목과 줄어든 종목을 함께 보기 위해 비중 변화의 절대값이 큰 순서로 "
+            "골랐습니다. 신규 편입과 전량 매도 종목도 포함됩니다. "
+            "가로축 단위는 %포인트입니다."
+        )
+
+        chart_data = top_weight_changes(comparison)
+        if chart_data.empty:
+            st.info("비중이 변한 종목이 없습니다.")
+        else:
+            st.altair_chart(weight_change_chart(chart_data), width="stretch")
 
 st.divider()
 
