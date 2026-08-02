@@ -1,11 +1,11 @@
 """AI 13F 포트폴리오 분석 PoC - 메인 화면.
 
-이번 단계에서는 SEC EDGAR에서 최근 13F-HR 공시 목록을 조회하고,
-그중 한 건을 골라 실제 보유 종목 목록과 포트폴리오 비중을 표로 보여줍니다.
-Gemini API 설명 생성은 다음 단계에서 추가합니다.
+SEC EDGAR에서 최근 13F-HR 공시를 조회해 보유 종목과 두 분기 변화를 보여주고,
+그 분석 결과를 Gemini API가 한국어 리서치 브리핑으로 설명해 줍니다.
 
 화면(이 파일)은 사용자에게 보여주는 일만 하고,
-실제 데이터 수집은 services/sec_client.py가 담당합니다.
+데이터 수집은 services/sec_client.py, 계산은 services/portfolio_analysis.py,
+브리핑 생성은 services/llm_client.py가 담당합니다.
 """
 
 from pathlib import Path
@@ -14,6 +14,11 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from services.llm_client import (
+    LlmApiError,
+    build_briefing_prompt,
+    generate_briefing,
+)
 from services.portfolio_analysis import (
     STATUS_DECREASED,
     STATUS_EXITED,
@@ -139,6 +144,29 @@ def read_sec_user_agent() -> str:
             "앱을 다시 실행해 주세요."
         )
     return str(user_agent)
+
+
+def read_gemini_settings() -> tuple[str, str]:
+    """Gemini 호출에 쓸 API 키와 모델명을 secrets에서 읽어옵니다.
+
+    값 자체는 화면이나 터미널에 절대 출력하지 않고, 생성 함수에만 전달합니다.
+    """
+    api_key = str(st.secrets.get("GEMINI_API_KEY", "") or "").strip()
+    model_name = str(st.secrets.get("GEMINI_MODEL", "") or "").strip()
+
+    missing = []
+    if not api_key:
+        missing.append("GEMINI_API_KEY")
+    if not model_name:
+        missing.append("GEMINI_MODEL")
+
+    if missing:
+        raise LookupError(
+            f"AI 브리핑에 필요한 설정({', '.join(missing)})이 등록되어 있지 않습니다. "
+            "`.streamlit/secrets.toml`에 해당 항목을 추가한 뒤 앱을 다시 실행해 주세요."
+        )
+
+    return api_key, model_name
 
 
 def to_display_table(filings: list[dict]) -> pd.DataFrame:
@@ -559,6 +587,9 @@ if st.button("두 분기 변화 분석", type="primary"):
     st.session_state["comparison_filings"] = None
     st.session_state["comparison_error"] = None
     st.session_state["comparison_warning"] = None
+    # 비교 결과를 새로 만들면, 앞서 생성한 AI 브리핑은 옛 데이터 기준이므로 지웁니다.
+    st.session_state["ai_briefing"] = None
+    st.session_state["ai_briefing_error"] = None
 
     try:
         # User-Agent는 여기서 읽어 조회 함수에만 넘깁니다. 화면에 표시하지 않습니다.
@@ -733,6 +764,75 @@ elif st.session_state.get("comparison") is not None:
             st.info("비중이 변한 종목이 없습니다.")
         else:
             st.altair_chart(weight_change_chart(chart_data), width="stretch")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# AI 브리핑 (Gemini)
+# ---------------------------------------------------------------------------
+
+st.subheader("AI 포트폴리오 브리핑")
+
+# 위에서 만든 두 분기 비교 결과가 있을 때만 이 기능을 씁니다.
+briefing_comparison = st.session_state.get("comparison")
+has_comparison = briefing_comparison is not None and not briefing_comparison.empty
+
+if not has_comparison:
+    st.info(
+        "먼저 위의 '두 분기 변화 분석' 버튼을 눌러 비교 결과를 만든 뒤 "
+        "AI 브리핑을 생성할 수 있습니다."
+    )
+else:
+    st.caption(
+        "위에서 Python이 계산한 두 분기 분석 결과(요약 지표와 주요 변화 종목)만 "
+        "Gemini에 전달해 한국어 설명을 만듭니다. Gemini는 새로운 숫자를 계산하지 않습니다."
+    )
+
+    # 버튼을 눌렀을 때만 API를 호출합니다. 화면이 다시 그려져도 자동 호출되지 않습니다.
+    if st.button("AI 브리핑 생성", type="primary"):
+        st.session_state["ai_briefing"] = None
+        st.session_state["ai_briefing_error"] = None
+
+        try:
+            # API 키와 모델명은 여기서 읽어 생성 함수에만 넘깁니다. 화면에 표시하지 않습니다.
+            gemini_api_key, gemini_model = read_gemini_settings()
+
+            briefing_filings = st.session_state.get("comparison_filings") or {}
+            prompt = build_briefing_prompt(
+                briefing_comparison,
+                st.session_state.get("comparison_summary") or {},
+                briefing_filings.get("current") or {},
+                briefing_filings.get("previous") or {},
+                manager["name"],
+            )
+
+            with st.spinner("Gemini가 분석 결과를 정리하는 중입니다..."):
+                st.session_state["ai_briefing"] = generate_briefing(
+                    prompt,
+                    api_key=gemini_api_key,
+                    model_name=gemini_model,
+                )
+        except LookupError as error:
+            # GEMINI_API_KEY 또는 GEMINI_MODEL 설정이 없는 경우.
+            st.session_state["ai_briefing_error"] = str(error)
+        except LlmApiError as error:
+            # llm_client가 만들어 준 한국어 안내 메시지를 그대로 보여줍니다.
+            st.session_state["ai_briefing_error"] = str(error)
+        except Exception:
+            # 예상하지 못한 오류. 내부 정보가 새지 않도록 상세 내용은 보여주지 않습니다.
+            st.session_state["ai_briefing_error"] = (
+                "AI 브리핑을 만드는 중 예상하지 못한 문제가 발생했습니다. "
+                "잠시 후 다시 시도해 주세요."
+            )
+
+    if st.session_state.get("ai_briefing_error"):
+        st.error(st.session_state["ai_briefing_error"])
+    elif st.session_state.get("ai_briefing"):
+        st.warning(
+            "AI 생성 결과는 투자 권유가 아니며 제공된 13F 분석 데이터만 요약합니다. "
+            "내용에 사실과 다른 부분이 있을 수 있으니 위의 표와 숫자를 함께 확인해 주세요."
+        )
+        st.markdown(st.session_state["ai_briefing"])
 
 st.divider()
 
