@@ -75,6 +75,9 @@ _INSTRUCTIONS = """당신은 미국 SEC 13F 공시 데이터를 일반 독자에
 - [분석 데이터]에 없는 사실이나 숫자를 만들어내지 마세요. 새로 계산하지도 마세요.
 - 데이터에 없는 종목명, 산업 분류, 주가, 시장 전망을 덧붙이지 마세요.
 - 평가금액 변화를 실제 매수·매도 금액이라고 단정하지 마세요.
+- 평가금액의 단위를 '천 달러'나 '달러'라고 단정하거나 추정하지 마세요. 금액은 SEC
+  Information Table의 reported value 값이므로, 단위를 붙이지 말고 숫자를 그대로 쓰거나
+  '공시 평가금액'이라고만 표현하세요. 임의로 단위를 곱하거나 나누어 환산하지 마세요.
 - 평가금액 변화에는 보유수량 변화와 주가 변화가 함께 반영된다는 점을 본문에 밝혀 주세요.
 - 투자 추천, 목표주가, 매수·매도 의견을 쓰지 마세요.
 - 이 글이 교육용 분석이라는 점을 밝혀 주세요.
@@ -130,9 +133,9 @@ def build_briefing_prompt(
         f"- 이전 분기 제출일(filing_date): {_text(previous_filing.get('filing_date'))}",
         "",
         "## 전체 규모",
-        f"- 현재 분기 전체 평가금액: {_number(summary.get('current_total_value'))} 천 달러",
-        f"- 이전 분기 전체 평가금액: {_number(summary.get('previous_total_value'))} 천 달러",
-        f"- 증감액: {_number(summary.get('total_value_change'), signed=True)} 천 달러",
+        f"- 현재 분기 전체 평가금액(reported value): {_number(summary.get('current_total_value'))}",
+        f"- 이전 분기 전체 평가금액(reported value): {_number(summary.get('previous_total_value'))}",
+        f"- 증감액: {_number(summary.get('total_value_change'), signed=True)}",
         f"- 증감률: {_percent(summary.get('total_value_change_pct'))}",
         "",
         "## 종목 수 변화",
@@ -157,7 +160,9 @@ def build_briefing_prompt(
         f"## 전량 매도 상위 {TOP_CHANGE_COUNT}개 종목",
         _format_rows(_top_exited_positions(table)),
         "",
-        "단위 안내: 평가금액은 SEC 13F 서식 기준 천 달러 단위입니다. "
+        "값 출처 안내: 평가금액은 SEC Information Table의 reported value 필드 값을 "
+        "환산 없이 그대로 사용한 것입니다. 이 데이터에는 금액 단위가 명시되어 있지 "
+        "않으므로, 단위를 추정하지 말고 숫자만 그대로 인용하세요. "
         "비중은 %, 비중 변화는 %포인트(%p)입니다.",
         "",
         "위 [분석 데이터]만 사용해 앞에서 지시한 5개 항목의 브리핑을 작성하세요.",
@@ -274,11 +279,11 @@ def _to_comparison_frame(comparison) -> pd.DataFrame:
 
 def _top_holdings(table: pd.DataFrame) -> pd.DataFrame:
     """현재 분기 평가금액이 큰 상위 종목을 고릅니다."""
-    if table.empty or "current_value_thousands" not in table.columns:
+    if table.empty or "current_reported_value" not in table.columns:
         return table.head(0)
 
-    held = table[table["current_value_thousands"] > 0]
-    return held.sort_values("current_value_thousands", ascending=False).head(
+    held = table[table["current_reported_value"] > 0]
+    return held.sort_values("current_reported_value", ascending=False).head(
         TOP_HOLDINGS_COUNT
     )
 
@@ -310,7 +315,7 @@ def _top_new_positions(table: pd.DataFrame) -> pd.DataFrame:
     rows = _rows_with_status(table, STATUS_NEW)
     if rows.empty:
         return rows
-    return rows.sort_values("current_value_thousands", ascending=False).head(
+    return rows.sort_values("current_reported_value", ascending=False).head(
         TOP_CHANGE_COUNT
     )
 
@@ -320,7 +325,7 @@ def _top_exited_positions(table: pd.DataFrame) -> pd.DataFrame:
     rows = _rows_with_status(table, STATUS_EXITED)
     if rows.empty:
         return rows
-    return rows.sort_values("previous_value_thousands", ascending=False).head(
+    return rows.sort_values("previous_reported_value", ascending=False).head(
         TOP_CHANGE_COUNT
     )
 
@@ -345,8 +350,8 @@ def _format_row(row) -> str:
     name = _text(row.get("issuer_name")) or _text(row.get("cusip"))
     return (
         f"- {name} (CUSIP {_text(row.get('cusip'))}): "
-        f"현재 평가금액 {_number(row.get('current_value_thousands'))}, "
-        f"이전 평가금액 {_number(row.get('previous_value_thousands'))}, "
+        f"현재 평가금액 {_number(row.get('current_reported_value'))}, "
+        f"이전 평가금액 {_number(row.get('previous_reported_value'))}, "
         f"현재 비중 {_percent(row.get('current_weight'), signed=False)}, "
         f"이전 비중 {_percent(row.get('previous_weight'), signed=False)}, "
         f"비중 변화 {_percent(row.get('weight_change_pct_point'))}p, "

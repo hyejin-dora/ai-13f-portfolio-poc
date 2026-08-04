@@ -3,7 +3,7 @@
 역할:
     미국 증권거래위원회(SEC) EDGAR 시스템에서 특정 기관투자자(CIK 기준)의
     13F-HR 공시를 찾아 보유 종목 목록(종목명, CUSIP, 평가금액, 보유 주식 수 등)을
-    가져오는 책임을 맡습니다.
+    가져오는 책임을 맡습니다. 공시 값은 해석하거나 환산하지 않고 원문 그대로 전달합니다.
 
 현재 구현된 기능:
     - CIK를 10자리 형식으로 맞추기 (normalize_cik)
@@ -393,7 +393,7 @@ def parse_information_table(xml_text: str) -> list[dict]:
             issuer_name: 발행사명
             class_title: 증권 종류
             cusip: CUSIP(증권 고유 번호)
-            value_thousands: 공시 평가금액
+            reported_value: Information Table의 value 칸에 적힌 공시 평가금액
             shares: 보유수량
             share_type: 주식 수량 단위(SH=주식, PRN=원금)
             put_call: Put 또는 Call 정보. 일반 주식은 빈 문자열입니다.
@@ -402,9 +402,9 @@ def parse_information_table(xml_text: str) -> list[dict]:
         SecApiError: XML 형식이 깨져서 읽을 수 없는 경우.
 
     Note:
-        value_thousands는 SEC 서식의 value 칸을 그대로 담습니다. SEC는 2023년
-        중반에 이 칸의 단위를 '천 달러'에서 '달러'로 바꿨으므로, 화면에 표시할 때는
-        공시 시점을 함께 고려해야 합니다.
+        reported_value는 SEC Information Table의 value 필드를 원문 그대로 담습니다.
+        이 모듈은 단위를 해석하거나 환산하지 않으므로, 값의 단위는 공시 원문을
+        따릅니다.
     """
     try:
         root = ElementTree.fromstring((xml_text or "").strip())
@@ -423,7 +423,7 @@ def parse_information_table(xml_text: str) -> list[dict]:
                 "issuer_name": _descendant_text(element, "nameOfIssuer"),
                 "class_title": _descendant_text(element, "titleOfClass"),
                 "cusip": _descendant_text(element, "cusip"),
-                "value_thousands": _to_number(_descendant_text(element, "value")),
+                "reported_value": _to_number(_descendant_text(element, "value")),
                 # 보유수량과 단위는 shrsOrPrnAmt 안에 들어 있지만, 하위 태그까지
                 # 훑기 때문에 감싸는 태그가 없거나 달라도 찾아냅니다.
                 "shares": _to_number(_descendant_text(element, "sshPrnamt")),

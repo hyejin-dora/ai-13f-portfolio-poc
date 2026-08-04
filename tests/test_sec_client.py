@@ -557,7 +557,7 @@ def test_parse_information_table_reads_expected_fields():
         "issuer_name": "APPLE INC",
         "class_title": "COM",
         "cusip": "037833100",
-        "value_thousands": 66643000,
+        "reported_value": 66643000,
         "shares": 300000000,
         "share_type": "SH",
         "put_call": "",
@@ -570,10 +570,22 @@ def test_parse_information_table_converts_numbers_with_commas():
     coca_cola = holdings[1]
 
     assert coca_cola["issuer_name"] == "COCA COLA CO"
-    assert coca_cola["value_thousands"] == 1234567
+    assert coca_cola["reported_value"] == 1234567
     assert coca_cola["shares"] == 400000000
-    assert isinstance(coca_cola["value_thousands"], int)
+    assert isinstance(coca_cola["reported_value"], int)
     assert coca_cola["put_call"] == "Call"
+
+
+def test_parse_information_table_keeps_reported_value_unconverted():
+    """reported_value가 XML의 value 값 그대로인지(환산하지 않는지) 확인합니다.
+
+    1,000을 곱하거나 나누는 단위 환산이 끼어들면 이 테스트가 실패합니다.
+    """
+    holdings = parse_information_table(SAMPLE_INFORMATION_TABLE_XML)
+
+    # XML 원문: <value>66643000</value>, <value>1,234,567</value>
+    assert holdings[0]["reported_value"] == 66643000
+    assert holdings[1]["reported_value"] == 1234567
 
 
 def test_parse_information_table_survives_missing_optional_fields():
@@ -584,7 +596,7 @@ def test_parse_information_table_survives_missing_optional_fields():
     assert kraft["issuer_name"] == "KRAFT HEINZ CO"
     assert kraft["shares"] == 325634818
     # value가 비어 있으면 숫자로 바꿀 수 없으므로 None입니다.
-    assert kraft["value_thousands"] is None
+    assert kraft["reported_value"] is None
     # 없는 선택 항목은 빈 문자열로 채워집니다.
     assert kraft["share_type"] == ""
     assert kraft["put_call"] == ""
@@ -599,7 +611,7 @@ def test_parse_information_table_handles_namespace():
         "issuer_name": "BANK OF AMERICA CORP",
         "class_title": "COM",
         "cusip": "060505104",
-        "value_thousands": 41074000,
+        "reported_value": 41074000,
         "shares": 1032852006,
         "share_type": "SH",
         "put_call": "Put",

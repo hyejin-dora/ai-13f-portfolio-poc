@@ -38,21 +38,21 @@ PREVIOUS_HOLDINGS = [
         "issuer_name": "APPLE INC",
         "class_title": "COM",
         "cusip": "037833100",
-        "value_thousands": 1000,
+        "reported_value": 1000,
         "shares": 100,
     },
     {
         "issuer_name": "COCA COLA CO",
         "class_title": "COM",
         "cusip": "191216100",
-        "value_thousands": 500,
+        "reported_value": 500,
         "shares": 50,
     },
     {
         "issuer_name": "BANK OF AMERICA CORP",
         "class_title": "COM",
         "cusip": "060505104",
-        "value_thousands": 300,
+        "reported_value": 300,
         "shares": 30,
     },
 ]
@@ -62,21 +62,21 @@ CURRENT_HOLDINGS = [
         "issuer_name": "APPLE INC",
         "class_title": "COM",
         "cusip": "037833100",
-        "value_thousands": 1500,
+        "reported_value": 1500,
         "shares": 120,
     },
     {
         "issuer_name": "COCA COLA CO",
         "class_title": "COM",
         "cusip": "191216100",
-        "value_thousands": 400,
+        "reported_value": 400,
         "shares": 40,
     },
     {
         "issuer_name": "OCCIDENTAL PETROLEUM CORP",
         "class_title": "COM",
         "cusip": "674599105",
-        "value_thousands": 700,
+        "reported_value": 700,
         "shares": 70,
     },
 ]
@@ -178,14 +178,14 @@ def test_보유_종목이_많아도_프롬프트에_무제한으로_담기지_�
             "issuer_name": f"COMPANY {index:03d}",
             "class_title": "COM",
             "cusip": f"{index:09d}",
-            "value_thousands": 1000 - index,
+            "reported_value": 1000 - index,
             "shares": 100 - index,
         }
         for index in range(60)
     ]
     # 현재 분기에는 보유수량을 하나씩 늘려 모든 종목이 '보유 확대'가 되게 합니다.
     current = [
-        {**row, "value_thousands": row["value_thousands"] + 10, "shares": row["shares"] + 1}
+        {**row, "reported_value": row["reported_value"] + 10, "shares": row["shares"] + 1}
         for row in previous
     ]
 

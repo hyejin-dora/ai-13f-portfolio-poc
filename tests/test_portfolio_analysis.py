@@ -40,7 +40,7 @@ PREVIOUS_HOLDINGS = [
         "issuer_name": "APPLE INC",
         "class_title": "COM",
         "cusip": "037833100",
-        "value_thousands": 1000,
+        "reported_value": 1000,
         "shares": 100,
         "share_type": "SH",
         "put_call": "",
@@ -49,7 +49,7 @@ PREVIOUS_HOLDINGS = [
         "issuer_name": "COCA COLA CO",
         "class_title": "COM",
         "cusip": "191216100",
-        "value_thousands": 500,
+        "reported_value": 500,
         "shares": 50,
         "share_type": "SH",
         "put_call": "",
@@ -58,7 +58,7 @@ PREVIOUS_HOLDINGS = [
         "issuer_name": "BANK OF AMERICA CORP",
         "class_title": "COM",
         "cusip": "060505104",
-        "value_thousands": 300,
+        "reported_value": 300,
         "shares": 30,
         "share_type": "SH",
         "put_call": "",
@@ -68,7 +68,7 @@ PREVIOUS_HOLDINGS = [
         "issuer_name": "WELLS FARGO & CO",
         "class_title": "COM",
         "cusip": "949746101",
-        "value_thousands": 100,
+        "reported_value": 100,
         "shares": 10,
         "share_type": "SH",
         "put_call": "",
@@ -78,7 +78,7 @@ PREVIOUS_HOLDINGS = [
         "issuer_name": "",
         "class_title": "",
         "cusip": "949746101",
-        "value_thousands": 200,
+        "reported_value": 200,
         "shares": 20,
         "share_type": "SH",
         "put_call": "",
@@ -90,7 +90,7 @@ CURRENT_HOLDINGS = [
         "issuer_name": "APPLE INC",
         "class_title": "COM",
         "cusip": "037833100",
-        "value_thousands": 1500,
+        "reported_value": 1500,
         "shares": 120,
         "share_type": "SH",
         "put_call": "",
@@ -99,7 +99,7 @@ CURRENT_HOLDINGS = [
         "issuer_name": "COCA COLA CO",
         "class_title": "COM",
         "cusip": "191216100",
-        "value_thousands": 400,
+        "reported_value": 400,
         "shares": 40,
         "share_type": "SH",
         "put_call": "",
@@ -108,7 +108,7 @@ CURRENT_HOLDINGS = [
         "issuer_name": "WELLS FARGO & CO",
         "class_title": "COM",
         "cusip": "949746101",
-        "value_thousands": 300,
+        "reported_value": 300,
         "shares": 30,
         "share_type": "SH",
         "put_call": "",
@@ -117,7 +117,7 @@ CURRENT_HOLDINGS = [
         "issuer_name": "OCCIDENTAL PETROLEUM CORP",
         "class_title": "COM",
         "cusip": "674599105",
-        "value_thousands": 700,
+        "reported_value": 700,
         "shares": 70,
         "share_type": "SH",
         "put_call": "",
@@ -152,11 +152,11 @@ def test_classifies_new_position(comparison):
 
     assert occidental["change_status"] == STATUS_NEW
     assert occidental["issuer_name"] == "OCCIDENTAL PETROLEUM CORP"
-    assert occidental["previous_value_thousands"] == 0
+    assert occidental["previous_reported_value"] == 0
     assert occidental["previous_shares"] == 0
-    assert occidental["current_value_thousands"] == 700
+    assert occidental["current_reported_value"] == 700
     assert occidental["current_shares"] == 70
-    assert occidental["value_change_thousands"] == 700
+    assert occidental["reported_value_change"] == 700
     assert occidental["shares_change"] == 70
 
 
@@ -172,10 +172,10 @@ def test_classifies_exited_position(comparison):
     assert bank_of_america["change_status"] == STATUS_EXITED
     # 이전 분기 공시에만 있으므로 이름은 이전 공시 표기를 씁니다.
     assert bank_of_america["issuer_name"] == "BANK OF AMERICA CORP"
-    assert bank_of_america["previous_value_thousands"] == 300
-    assert bank_of_america["current_value_thousands"] == 0
+    assert bank_of_america["previous_reported_value"] == 300
+    assert bank_of_america["current_reported_value"] == 0
     assert bank_of_america["current_shares"] == 0
-    assert bank_of_america["value_change_thousands"] == -300
+    assert bank_of_america["reported_value_change"] == -300
     assert bank_of_america["shares_change"] == -30
     # 전량 매도이므로 변화율은 -100%입니다.
     assert bank_of_america["value_change_pct"] == pytest.approx(-100.0)
@@ -210,7 +210,7 @@ def test_classifies_increased_position(comparison):
     assert apple["previous_shares"] == 100
     assert apple["current_shares"] == 120
     assert apple["shares_change"] == 20
-    assert apple["value_change_thousands"] == 500
+    assert apple["reported_value_change"] == 500
     assert apple["value_change_pct"] == pytest.approx(50.0)
 
 
@@ -222,7 +222,7 @@ def test_classifies_decreased_position(comparison):
     assert coca_cola["previous_shares"] == 50
     assert coca_cola["current_shares"] == 40
     assert coca_cola["shares_change"] == -10
-    assert coca_cola["value_change_thousands"] == -100
+    assert coca_cola["reported_value_change"] == -100
     assert coca_cola["value_change_pct"] == pytest.approx(-20.0)
 
 
@@ -254,7 +254,7 @@ def test_aggregate_holdings_sums_duplicate_cusip_rows():
     assert len(aggregated) == 4
 
     wells_fargo = aggregated[aggregated["cusip"] == "949746101"].iloc[0]
-    assert wells_fargo["value_thousands"] == 300  # 100 + 200
+    assert wells_fargo["reported_value"] == 300  # 100 + 200
     assert wells_fargo["shares"] == 30  # 10 + 20
     # 비어 있는 값 대신, 비어 있지 않은 첫 번째 값을 씁니다.
     assert wells_fargo["issuer_name"] == "WELLS FARGO & CO"
@@ -265,15 +265,15 @@ def test_compare_holdings_uses_summed_duplicate_rows(comparison):
     """비교 결과에도 합산된 값이 반영되는지 확인합니다."""
     wells_fargo = row_of(comparison, "949746101")
 
-    assert wells_fargo["previous_value_thousands"] == 300
+    assert wells_fargo["previous_reported_value"] == 300
     assert wells_fargo["previous_shares"] == 30
 
 
 def test_aggregate_holdings_uses_first_valid_issuer_name():
     """앞쪽 줄의 이름이 비어 있으면 뒤쪽 줄의 이름을 사용합니다."""
     holdings = [
-        {"cusip": "111111111", "issuer_name": "", "class_title": "", "value_thousands": 10, "shares": 1},
-        {"cusip": "111111111", "issuer_name": "SECOND ROW CO", "class_title": "COM", "value_thousands": 20, "shares": 2},
+        {"cusip": "111111111", "issuer_name": "", "class_title": "", "reported_value": 10, "shares": 1},
+        {"cusip": "111111111", "issuer_name": "SECOND ROW CO", "class_title": "COM", "reported_value": 20, "shares": 2},
     ]
 
     aggregated = aggregate_holdings(holdings)
@@ -281,7 +281,7 @@ def test_aggregate_holdings_uses_first_valid_issuer_name():
     assert len(aggregated) == 1
     assert aggregated.iloc[0]["issuer_name"] == "SECOND ROW CO"
     assert aggregated.iloc[0]["class_title"] == "COM"
-    assert aggregated.iloc[0]["value_thousands"] == 30
+    assert aggregated.iloc[0]["reported_value"] == 30
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +427,7 @@ def test_aggregate_holdings_handles_empty_input():
         "cusip",
         "issuer_name",
         "class_title",
-        "value_thousands",
+        "reported_value",
         "shares",
     ]
 
@@ -493,7 +493,7 @@ def test_result_columns_and_order(comparison):
 
 def test_result_is_sorted_by_current_value_descending(comparison):
     """현재 분기 평가금액이 큰 종목부터 정렬되는지 확인합니다."""
-    values = comparison["current_value_thousands"].tolist()
+    values = comparison["current_reported_value"].tolist()
 
     assert values == sorted(values, reverse=True)
     assert values == [1500, 700, 400, 300, 0]
@@ -508,14 +508,14 @@ def test_non_numeric_values_are_treated_as_zero():
             "issuer_name": "MESSY DATA CO",
             "class_title": "COM",
             "cusip": "222222222",
-            "value_thousands": "알 수 없음",
+            "reported_value": "알 수 없음",
             "shares": None,
         },
         {
             "issuer_name": "NORMAL CO",
             "class_title": "COM",
             "cusip": "333333333",
-            "value_thousands": 100,
+            "reported_value": 100,
             "shares": 10,
         },
     ]
@@ -523,7 +523,7 @@ def test_non_numeric_values_are_treated_as_zero():
     result = compare_holdings(messy_holdings, messy_holdings)
 
     messy = row_of(result, "222222222")
-    assert messy["current_value_thousands"] == 0
+    assert messy["current_reported_value"] == 0
     assert messy["current_shares"] == 0
     assert messy["change_status"] == STATUS_UNCHANGED
 
@@ -535,7 +535,7 @@ def test_non_numeric_values_are_treated_as_zero():
 def test_missing_optional_columns_do_not_break_comparison():
     """일부 키가 아예 없는 데이터도 오류 없이 처리됩니다."""
     holdings_without_class_title = [
-        {"cusip": "444444444", "issuer_name": "NO CLASS CO", "value_thousands": 50, "shares": 5},
+        {"cusip": "444444444", "issuer_name": "NO CLASS CO", "reported_value": 50, "shares": 5},
     ]
 
     result = compare_holdings([], holdings_without_class_title)
@@ -548,14 +548,14 @@ def test_missing_optional_columns_do_not_break_comparison():
 def test_value_increase_without_share_change_is_unchanged():
     """주가만 올라 평가금액이 늘고 보유수량은 같으면 '유지'로 봅니다."""
     previous = [
-        {"cusip": "555555555", "issuer_name": "HOLD CO", "class_title": "COM", "value_thousands": 100, "shares": 10},
+        {"cusip": "555555555", "issuer_name": "HOLD CO", "class_title": "COM", "reported_value": 100, "shares": 10},
     ]
     current = [
-        {"cusip": "555555555", "issuer_name": "HOLD CO", "class_title": "COM", "value_thousands": 150, "shares": 10},
+        {"cusip": "555555555", "issuer_name": "HOLD CO", "class_title": "COM", "reported_value": 150, "shares": 10},
     ]
 
     result = compare_holdings(previous, current)
 
     assert result.iloc[0]["change_status"] == STATUS_UNCHANGED
-    assert result.iloc[0]["value_change_thousands"] == 50
+    assert result.iloc[0]["reported_value_change"] == 50
     assert result.iloc[0]["shares_change"] == 0

@@ -58,14 +58,14 @@ HOLDINGS_COLUMNS = [
     "issuer_name",
     "class_title",
     "cusip",
-    "value_thousands",
+    "reported_value",
     "shares",
     "share_type",
     "put_call",
 ]
 
 # 숫자로 다뤄야 하는 열(합계와 비중 계산에 사용).
-NUMERIC_HOLDINGS_COLUMNS = ["value_thousands", "shares"]
+NUMERIC_HOLDINGS_COLUMNS = ["reported_value", "shares"]
 
 # 글자로 다뤄야 하는 열(값이 없으면 빈칸으로 표시).
 TEXT_HOLDINGS_COLUMNS = [
@@ -82,9 +82,9 @@ COMPARISON_DISPLAY_COLUMNS = [
     "issuer_name",
     "class_title",
     "cusip",
-    "previous_value_thousands",
-    "current_value_thousands",
-    "value_change_thousands",
+    "previous_reported_value",
+    "current_reported_value",
+    "reported_value_change",
     "previous_shares",
     "current_shares",
     "shares_change",
@@ -207,13 +207,13 @@ def build_holdings_table(holdings: list[dict]) -> pd.DataFrame:
 
     total_value = sum_portfolio_value(table)
     if total_value > 0:
-        table["portfolio_weight"] = table["value_thousands"] / total_value * 100
+        table["portfolio_weight"] = table["reported_value"] / total_value * 100
     else:
         # 금액이 모두 비어 있으면 비중을 계산할 수 없으므로 빈칸으로 둡니다.
         table["portfolio_weight"] = pd.NA
 
     sorted_table = table.sort_values(
-        "value_thousands", ascending=False, na_position="last"
+        "reported_value", ascending=False, na_position="last"
     )
     return sorted_table.reset_index(drop=True)
 
@@ -223,7 +223,7 @@ def sum_portfolio_value(table: pd.DataFrame) -> float:
     if table.empty:
         return 0.0
 
-    total = table["value_thousands"].sum(skipna=True)
+    total = table["reported_value"].sum(skipna=True)
     return float(total) if pd.notna(total) else 0.0
 
 
@@ -237,17 +237,20 @@ def format_percent(value, digits: int = 2) -> str:
 def comparison_column_config() -> dict:
     """분기 비교 표의 숫자 표시 형식을 정합니다.
 
-    열 이름은 분석 결과 그대로 두고, 단위 설명은 도움말(?)과 캡션으로 알려 줍니다.
+    열 이름은 분석 결과 그대로 두고, 값의 출처 설명은 도움말(?)과 캡션으로 알려 줍니다.
     """
     return {
-        "previous_value_thousands": st.column_config.NumberColumn(
-            help="이전 분기 공시 평가금액 (천 달러)", format="localized"
+        "previous_reported_value": st.column_config.NumberColumn(
+            help="이전 분기 공시 평가금액 (SEC Information Table의 reported value 필드)",
+            format="localized",
         ),
-        "current_value_thousands": st.column_config.NumberColumn(
-            help="현재 분기 공시 평가금액 (천 달러)", format="localized"
+        "current_reported_value": st.column_config.NumberColumn(
+            help="현재 분기 공시 평가금액 (SEC Information Table의 reported value 필드)",
+            format="localized",
         ),
-        "value_change_thousands": st.column_config.NumberColumn(
-            help="공시 평가금액 증감 (천 달러)", format="localized"
+        "reported_value_change": st.column_config.NumberColumn(
+            help="공시 평가금액 증감 (SEC Information Table의 reported value 필드 기준)",
+            format="localized",
         ),
         "previous_shares": st.column_config.NumberColumn(
             help="이전 분기 보유수량", format="localized"
@@ -519,27 +522,26 @@ elif st.session_state.get("holdings") is not None:
         count_column, value_column = st.columns(2)
         count_column.metric("전체 보유 종목 수", f"{len(holdings_table):,}개")
         value_column.metric(
-            "전체 공시 평가금액 합계", f"{total_value:,.0f} 천 달러"
+            "전체 공시 평가금액 합계", f"{total_value:,.0f}"
         )
         st.caption(
-            "공시 평가금액(value_thousands)의 단위는 SEC 13F 서식 기준 "
-            "**천 달러(=1,000달러)** 입니다. 예를 들어 1,000,000은 10억 달러를 뜻합니다. "
-            "다만 SEC는 2023년부터 이 칸을 달러 단위로 받고 있어, 최근 공시는 실제로 "
-            "달러 단위일 수 있으니 금액의 크기를 볼 때 참고해 주세요. "
+            "공시 평가금액(reported_value)은 **SEC Information Table의 reported value "
+            "필드를 사용합니다.** 이 화면은 값을 환산하지 않고 공시 원문 그대로 표시하므로, "
+            "금액의 단위는 해당 공시 원문을 기준으로 확인해 주세요. "
             "비중(%)은 같은 공시 안에서의 비율이라 단위와 관계없이 그대로 유효합니다."
         )
 
         # 3) 상위 10개 종목의 포트폴리오 비중
         st.markdown(f"**상위 {TOP_HOLDINGS_COUNT}개 종목 비중**")
         top_holdings = holdings_table.head(TOP_HOLDINGS_COUNT)[
-            ["issuer_name", "value_thousands", "portfolio_weight"]
+            ["issuer_name", "reported_value", "portfolio_weight"]
         ]
         st.dataframe(
             top_holdings,
             hide_index=True,
             width="stretch",
             column_config={
-                "value_thousands": st.column_config.NumberColumn(format="localized"),
+                "reported_value": st.column_config.NumberColumn(format="localized"),
                 "portfolio_weight": st.column_config.ProgressColumn(
                     help="전체 공시 평가금액 합계에서 이 종목이 차지하는 비율(%)",
                     format="%.2f%%",
@@ -556,7 +558,7 @@ elif st.session_state.get("holdings") is not None:
             hide_index=True,
             width="stretch",
             column_config={
-                "value_thousands": st.column_config.NumberColumn(format="localized"),
+                "reported_value": st.column_config.NumberColumn(format="localized"),
                 "shares": st.column_config.NumberColumn(format="localized"),
                 "portfolio_weight": st.column_config.NumberColumn(
                     help="전체 공시 평가금액 합계에서 이 종목이 차지하는 비율(%)",
@@ -687,11 +689,11 @@ elif st.session_state.get("comparison") is not None:
         st.markdown("**요약 지표**")
         value_columns = st.columns(3)
         value_columns[0].metric(
-            "현재 분기 전체 평가금액 (천 달러)",
+            "현재 분기 전체 평가금액",
             f"{summary.get('current_total_value', 0):,.0f}",
         )
         value_columns[1].metric(
-            "이전 분기 전체 평가금액 (천 달러)",
+            "이전 분기 전체 평가금액",
             f"{summary.get('previous_total_value', 0):,.0f}",
         )
         value_columns[2].metric(
@@ -699,8 +701,9 @@ elif st.session_state.get("comparison") is not None:
             format_percent(summary.get("total_value_change_pct")),
         )
         st.caption(
-            "평가금액의 단위는 SEC 13F 서식 기준 **천 달러(=1,000달러)** 입니다. "
-            f"증감액은 {summary.get('total_value_change', 0):+,.0f} 천 달러입니다."
+            "평가금액은 **SEC Information Table의 reported value 필드를 사용합니다.** "
+            "값은 환산하지 않고 공시 원문 그대로 표시합니다. "
+            f"증감액은 {summary.get('total_value_change', 0):+,.0f} 입니다."
         )
 
         count_columns = st.columns(5)
@@ -729,7 +732,8 @@ elif st.session_state.get("comparison") is not None:
         # --- C. 종목 변화 표 ------------------------------------------------
         st.markdown("**종목 변화 상세**")
         st.caption(
-            "평가금액 관련 열의 단위는 천 달러, 비중(previous_weight, current_weight)은 %, "
+            "평가금액 관련 열은 SEC Information Table의 reported value 필드를 사용합니다. "
+            "비중(previous_weight, current_weight)은 %, "
             "비중 변화(weight_change_pct_point)는 **%포인트**입니다."
         )
 

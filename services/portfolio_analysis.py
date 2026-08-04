@@ -16,7 +16,8 @@
 주의:
     - 종목을 구분하는 기준은 CUSIP(증권 고유 번호)입니다. 회사명은 공시마다
       표기가 조금씩 달라질 수 있어 식별 기준으로 쓰지 않습니다.
-    - 공시 평가금액(value_thousands)의 단위는 SEC 서식을 그대로 따릅니다.
+    - 공시 평가금액(reported_value)은 SEC Information Table의 reported value 필드
+      값을 그대로 사용합니다. 이 모듈은 단위를 해석하거나 환산하지 않습니다.
       비중(%)은 같은 분기 안에서의 비율이므로 단위와 무관하게 유효합니다.
 """
 
@@ -33,7 +34,7 @@ STATUS_UNCHANGED = "유지"
 
 # sec_client.get_13f_holdings가 돌려주는 키 중 이 모듈이 사용하는 것들.
 TEXT_INPUT_COLUMNS = ["cusip", "issuer_name", "class_title"]
-NUMERIC_INPUT_COLUMNS = ["value_thousands", "shares"]
+NUMERIC_INPUT_COLUMNS = ["reported_value", "shares"]
 INPUT_COLUMNS = TEXT_INPUT_COLUMNS + NUMERIC_INPUT_COLUMNS
 
 # CUSIP 기준으로 합산한 표의 열.
@@ -44,9 +45,9 @@ COMPARISON_COLUMNS = [
     "cusip",
     "issuer_name",
     "class_title",
-    "previous_value_thousands",
-    "current_value_thousands",
-    "value_change_thousands",
+    "previous_reported_value",
+    "current_reported_value",
+    "reported_value_change",
     "value_change_pct",
     "previous_shares",
     "current_shares",
@@ -62,9 +63,9 @@ _COMPARISON_DTYPES = {
     "cusip": "object",
     "issuer_name": "object",
     "class_title": "object",
-    "previous_value_thousands": "float64",
-    "current_value_thousands": "float64",
-    "value_change_thousands": "float64",
+    "previous_reported_value": "float64",
+    "current_reported_value": "float64",
+    "reported_value_change": "float64",
     "value_change_pct": "float64",
     "previous_shares": "float64",
     "current_shares": "float64",
@@ -91,7 +92,7 @@ def aggregate_holdings(holdings) -> pd.DataFrame:
             pandas DataFrame을 넘겨도 됩니다. 어느 경우든 원본은 바뀌지 않습니다.
 
     Returns:
-        cusip, issuer_name, class_title, value_thousands, shares 열을 가진 표.
+        cusip, issuer_name, class_title, reported_value, shares 열을 가진 표.
         입력이 비어 있으면 같은 열을 가진 빈 표를 돌려줍니다.
 
     Note:
@@ -109,7 +110,7 @@ def aggregate_holdings(holdings) -> pd.DataFrame:
         cusip=("cusip", _first_valid_text),
         issuer_name=("issuer_name", _first_valid_text),
         class_title=("class_title", _first_valid_text),
-        value_thousands=("value_thousands", "sum"),
+        reported_value=("reported_value", "sum"),
         shares=("shares", "sum"),
     )
 
@@ -158,30 +159,30 @@ def compare_holdings(previous_holdings, current_holdings) -> pd.DataFrame:
             "cusip": _prefer_current_text(merged, "cusip"),
             "issuer_name": _prefer_current_text(merged, "issuer_name"),
             "class_title": _prefer_current_text(merged, "class_title"),
-            "previous_value_thousands": _numeric_column(
-                merged, "value_thousands_previous"
+            "previous_reported_value": _numeric_column(
+                merged, "reported_value_previous"
             ),
-            "current_value_thousands": _numeric_column(
-                merged, "value_thousands_current"
+            "current_reported_value": _numeric_column(
+                merged, "reported_value_current"
             ),
             "previous_shares": _numeric_column(merged, "shares_previous"),
             "current_shares": _numeric_column(merged, "shares_current"),
         }
     )
 
-    result["value_change_thousands"] = (
-        result["current_value_thousands"] - result["previous_value_thousands"]
+    result["reported_value_change"] = (
+        result["current_reported_value"] - result["previous_reported_value"]
     )
     result["shares_change"] = result["current_shares"] - result["previous_shares"]
 
     # 0으로 나누지 않도록, 이전 평가금액이 0이면 NaN으로 바꿔 계산합니다.
     # NaN으로 나눈 결과도 NaN이 되므로 무한대(inf)가 생기지 않습니다.
-    previous_value = result["previous_value_thousands"]
+    previous_value = result["previous_reported_value"]
     divisor = previous_value.where(previous_value > 0)
-    result["value_change_pct"] = result["value_change_thousands"] / divisor * 100
+    result["value_change_pct"] = result["reported_value_change"] / divisor * 100
 
-    result["previous_weight"] = _weight(result["previous_value_thousands"])
-    result["current_weight"] = _weight(result["current_value_thousands"])
+    result["previous_weight"] = _weight(result["previous_reported_value"])
+    result["current_weight"] = _weight(result["current_reported_value"])
     result["weight_change_pct_point"] = (
         result["current_weight"] - result["previous_weight"]
     )
@@ -189,7 +190,7 @@ def compare_holdings(previous_holdings, current_holdings) -> pd.DataFrame:
     result["change_status"] = _classify_changes(result)
 
     sorted_result = result.sort_values(
-        ["current_value_thousands", "previous_value_thousands", "cusip"],
+        ["current_reported_value", "previous_reported_value", "cusip"],
         ascending=[False, False, True],
     )
 
@@ -228,8 +229,8 @@ def summarize_comparison(comparison: pd.DataFrame) -> dict:
             "unchanged_position_count": 0,
         }
 
-    current_total = _safe_sum(comparison, "current_value_thousands")
-    previous_total = _safe_sum(comparison, "previous_value_thousands")
+    current_total = _safe_sum(comparison, "current_reported_value")
+    previous_total = _safe_sum(comparison, "previous_reported_value")
     total_change = current_total - previous_total
 
     if previous_total > 0:
@@ -322,7 +323,7 @@ def _empty_aggregated() -> pd.DataFrame:
             "cusip": pd.Series(dtype="object"),
             "issuer_name": pd.Series(dtype="object"),
             "class_title": pd.Series(dtype="object"),
-            "value_thousands": pd.Series(dtype="float64"),
+            "reported_value": pd.Series(dtype="float64"),
             "shares": pd.Series(dtype="float64"),
         }
     )
@@ -376,10 +377,10 @@ def _classify_changes(result: pd.DataFrame) -> pd.Series:
 
     신규 편입과 전량 매도를 나중에 덮어써서, 확대·축소보다 우선하게 합니다.
     """
-    previously_held = (result["previous_value_thousands"] > 0) | (
+    previously_held = (result["previous_reported_value"] > 0) | (
         result["previous_shares"] > 0
     )
-    currently_held = (result["current_value_thousands"] > 0) | (
+    currently_held = (result["current_reported_value"] > 0) | (
         result["current_shares"] > 0
     )
 
