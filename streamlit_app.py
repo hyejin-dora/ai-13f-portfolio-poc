@@ -34,8 +34,26 @@ from services.sec_client import (
     get_recent_13f_filings,
 )
 
-# 이번 단계의 분석 대상 운용사. data/managers.csv에서 이 이름으로 찾습니다.
-TARGET_MANAGER = "Berkshire Hathaway"
+# 화면을 처음 열었을 때 기본으로 선택되는 운용사.
+# 목록 자체는 data/managers.csv에서 읽어오고, 사용자가 다른 기관으로 바꿀 수 있습니다.
+DEFAULT_MANAGER = "Berkshire Hathaway"
+
+# 기관을 바꿀 때 지워야 하는 화면 상태(세션 상태) 키 목록.
+# 이전 기관의 공시·보유 종목·분기 비교·AI 브리핑 결과가 화면에 남지 않게 하기 위함입니다.
+ANALYSIS_STATE_KEYS = (
+    "filings",
+    "error",
+    "holdings",
+    "holdings_error",
+    "holdings_filing",
+    "comparison",
+    "comparison_summary",
+    "comparison_filings",
+    "comparison_error",
+    "comparison_warning",
+    "ai_briefing",
+    "ai_briefing_error",
+)
 
 # 조회할 공시 건수.
 FILING_LIMIT = 2
@@ -134,6 +152,54 @@ def find_manager(managers: pd.DataFrame, name: str) -> dict:
 
     row = matched.iloc[0]
     return {"name": row["name"], "cik": row["cik"]}
+
+
+def manager_options(managers: pd.DataFrame) -> list[str]:
+    """선택 상자에 보여 줄 운용사 이름 목록을 만듭니다.
+
+    목록이 비어 있으면 고를 대상이 없으므로 LookupError를 냅니다.
+    """
+    names = [str(name) for name in managers["name"].tolist()]
+    if not names:
+        raise LookupError("운용사 목록이 비어 있습니다.")
+    return names
+
+
+def default_manager_index(names: list[str]) -> int:
+    """기본으로 선택할 운용사의 위치를 돌려줍니다.
+
+    기본 운용사가 목록에 없으면 첫 번째 항목을 씁니다.
+    """
+    if DEFAULT_MANAGER in names:
+        return names.index(DEFAULT_MANAGER)
+    return 0
+
+
+def reset_analysis_state(state) -> None:
+    """이전 기관의 조회·분석 결과를 화면 상태에서 지웁니다.
+
+    기관을 바꿨을 때만 호출합니다. 같은 기관에서 화면이 다시 그려질 때는
+    호출하지 않으므로, 이미 조회한 결과가 불필요하게 사라지지 않습니다.
+    """
+    for key in ANALYSIS_STATE_KEYS:
+        state[key] = None
+
+
+def sync_selected_manager(state, selected_name: str) -> bool:
+    """지금 고른 기관이 직전과 다른지 확인하고, 달라졌으면 결과를 지웁니다.
+
+    화면은 버튼을 누를 때마다 처음부터 다시 실행되므로, '직전에 고른 기관 이름'을
+    따로 기억해 두고 그 값과 비교합니다. 같은 기관이면 아무것도 지우지 않습니다.
+
+    Returns:
+        기관이 바뀌어서 결과를 지웠으면 True, 같은 기관이라 그대로 두었으면 False.
+    """
+    if state.get("active_manager_name") == selected_name:
+        return False
+
+    reset_analysis_state(state)
+    state["active_manager_name"] = selected_name
+    return True
 
 
 def read_sec_user_agent() -> str:
@@ -391,9 +457,10 @@ st.write(
 
 st.subheader("분석 대상")
 
-# 운용사 정보 읽기. 파일이 없거나 대상이 없으면 여기서 안내하고 멈춥니다.
+# 운용사 목록 읽기. 파일이 없거나 형식이 다르면 여기서 안내하고 멈춥니다.
 try:
-    manager = find_manager(load_managers(), TARGET_MANAGER)
+    managers = load_managers()
+    manager_names = manager_options(managers)
 except FileNotFoundError:
     st.error(
         "운용사 목록 파일(data/managers.csv)을 찾을 수 없습니다. "
@@ -403,11 +470,28 @@ except FileNotFoundError:
 except (LookupError, KeyError, pd.errors.ParserError):
     st.error(
         "운용사 목록 파일(data/managers.csv)을 읽을 수 없습니다. "
-        f"'{TARGET_MANAGER}' 항목과 name, cik 열이 있는지 확인해 주세요."
+        "name, cik 열과 한 곳 이상의 운용사가 있는지 확인해 주세요."
     )
     st.stop()
 
-st.write(f"{manager['name']} (CIK {manager['cik']})")
+selected_manager_name = st.selectbox(
+    "분석할 기관투자자를 선택하세요",
+    options=manager_names,
+    index=default_manager_index(manager_names),
+    key="selected_manager_name",
+)
+
+# 기관을 바꿨을 때만 앞선 기관의 결과를 지웁니다.
+# 같은 기관에서 버튼을 눌러 화면이 다시 그려질 때는 결과가 그대로 남습니다.
+sync_selected_manager(st.session_state, selected_manager_name)
+
+try:
+    manager = find_manager(managers, selected_manager_name)
+except (LookupError, KeyError) as error:
+    st.error(str(error))
+    st.stop()
+
+st.write(f"**{manager['name']}** (CIK {manager['cik']})")
 
 st.divider()
 
