@@ -78,10 +78,15 @@ TEXT_HOLDINGS_COLUMNS = [
 
 # 분기 비교 표에 보여 줄 열 순서. 사람이 읽기 쉽게 종목명을 앞에 둡니다.
 # (분석 결과 표의 열 이름은 그대로 쓰고, 순서만 바꿉니다.)
+# put_call과 share_type은 같은 회사라도 보통주 보유와 옵션 보유가 별개의 줄로
+# 나뉘는 이유를 알 수 있게 함께 보여 줍니다. 내부 식별용 position_key는
+# 표에 넣지 않습니다.
 COMPARISON_DISPLAY_COLUMNS = [
     "issuer_name",
     "class_title",
     "cusip",
+    "put_call",
+    "share_type",
     "previous_reported_value",
     "current_reported_value",
     "reported_value_change",
@@ -240,6 +245,12 @@ def comparison_column_config() -> dict:
     열 이름은 분석 결과 그대로 두고, 값의 출처 설명은 도움말(?)과 캡션으로 알려 줍니다.
     """
     return {
+        "put_call": st.column_config.TextColumn(
+            help="옵션 구분. 값이 있으면 Put/Call 보유이고, 비어 있으면 일반 주식 보유입니다."
+        ),
+        "share_type": st.column_config.TextColumn(
+            help="수량 단위 (SH=주식 수, PRN=원금액)"
+        ),
         "previous_reported_value": st.column_config.NumberColumn(
             help="이전 분기 공시 평가금액 (SEC Information Table의 reported value 필드)",
             format="localized",
@@ -290,8 +301,13 @@ def top_weight_changes(comparison: pd.DataFrame) -> pd.DataFrame:
     top = table.sort_values("절대 변화", ascending=False).head(TOP_WEIGHT_CHANGE_COUNT)
     top = top[top["절대 변화"] > 0]
 
-    # 같은 이름이 겹치면 막대가 합쳐져 보이므로 CUSIP 뒷자리를 덧붙여 구분합니다.
+    # 같은 회사의 옵션 보유는 별개의 포지션이므로 이름에 Put/Call 표시를 덧붙입니다.
     labels = top["issuer_name"].where(top["issuer_name"] != "", top["cusip"])
+    if "put_call" in top.columns:
+        option_marks = top["put_call"].fillna("").astype(str).str.strip()
+        labels = labels.where(option_marks == "", labels + " (" + option_marks + ")")
+
+    # 그래도 같은 이름이 겹치면 막대가 합쳐져 보이므로 CUSIP 뒷자리로 구분합니다.
     if labels.duplicated().any():
         labels = labels + " (" + top["cusip"].str[-4:] + ")"
 
@@ -734,7 +750,9 @@ elif st.session_state.get("comparison") is not None:
         st.caption(
             "평가금액 관련 열은 SEC Information Table의 reported value 필드를 사용합니다. "
             "비중(previous_weight, current_weight)은 %, "
-            "비중 변화(weight_change_pct_point)는 **%포인트**입니다."
+            "비중 변화(weight_change_pct_point)는 **%포인트**입니다. "
+            "같은 회사라도 **일반 주식 보유와 Put/Call 옵션 보유, 수량 단위(share_type)가 "
+            "다른 보유는 서로 다른 줄**로 비교합니다."
         )
 
         status_counts = comparison["change_status"].value_counts()
