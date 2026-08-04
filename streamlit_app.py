@@ -6,6 +6,10 @@ SEC EDGAR에서 최근 13F-HR 공시를 조회해 보유 종목과 두 분기 �
 화면(이 파일)은 사용자에게 보여주는 일만 하고,
 데이터 수집은 services/sec_client.py, 계산은 services/portfolio_analysis.py,
 브리핑 생성은 services/llm_client.py가 담당합니다.
+
+SEC 조회 결과를 잠시 보관해 두고 재사용하는 캐시도 이 파일이 맡습니다.
+캐시는 Streamlit 전용 기능(st.cache_data)이므로, 수집 로직이 들어 있는
+services/sec_client.py는 캐시를 모른 채 순수한 조회 함수로 남습니다.
 """
 
 from pathlib import Path
@@ -60,6 +64,25 @@ FILING_LIMIT = 2
 
 # 비중 상위 몇 개 종목을 따로 보여줄지.
 TOP_HOLDINGS_COUNT = 10
+
+# SEC 조회 결과를 얼마나 오래 재사용할지(초). 6시간.
+# 13F는 분기마다 나오는 공시라 하루 안에 내용이 바뀌는 일이 거의 없으므로,
+# 같은 값을 반복해서 내려받지 않도록 넉넉하게 잡았습니다.
+SEC_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+# 행이 많은 표(예: 보유 종목이 수백 개인 기관)의 표시 높이(픽셀).
+# 높이를 정해 두면 표 안에서만 스크롤되어 화면이 지나치게 길어지지 않습니다.
+LARGE_TABLE_HEIGHT = 520
+
+# 몇 행을 넘을 때부터 위 높이를 적용할지. 이보다 적으면 높이를 정하지 않아
+# (자동 높이) 표 아래에 빈 공간이 생기지 않습니다.
+LARGE_TABLE_ROW_THRESHOLD = 15
+
+# 캐시를 비운 뒤 사용자에게 보여 줄 안내 문구.
+CACHE_CLEARED_MESSAGE = (
+    "SEC 조회 캐시를 비웠습니다. 최신 데이터를 받으려면 "
+    "'최근 13F 공시 조회'와 '두 분기 변화 분석' 버튼을 다시 눌러 주세요."
+)
 
 MANAGERS_CSV = Path(__file__).parent / "data" / "managers.csv"
 
@@ -217,6 +240,55 @@ def read_sec_user_agent() -> str:
     return str(user_agent)
 
 
+# ---------------------------------------------------------------------------
+# SEC 조회 캐시
+#
+# 같은 기관·같은 공시를 다시 볼 때마다 SEC에 또 요청하면 느리고, SEC의 요청 빈도
+# 제한에도 걸릴 수 있습니다. 그래서 화면 쪽에서 조회 결과를 잠시 보관해 두고
+# 재사용합니다(캐시). 수집 로직 자체는 services/sec_client.py에 그대로 두고,
+# Streamlit 전용 기능인 캐시만 이 파일에서 감쌉니다.
+#
+# st.cache_data는 함수에 넘긴 인자를 '보관함 이름표'로 씁니다. 따라서 아래
+# 두 함수는 cik / limit / accession_number / user_agent가 모두 같을 때만
+# 보관해 둔 값을 돌려주고, 하나라도 다르면 SEC에 새로 요청합니다.
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data(ttl=SEC_CACHE_TTL_SECONDS, show_spinner=False)
+def cached_recent_filings(cik: str, limit: int, user_agent: str) -> list[dict]:
+    """최근 13F 공시 목록을 조회하고 결과를 캐시에 보관합니다.
+
+    반환값은 get_recent_13f_filings와 같은 dict 목록입니다.
+    (캐시 이름표: cik, limit, user_agent)
+    """
+    return get_recent_13f_filings(cik, user_agent=user_agent, limit=limit)
+
+
+@st.cache_data(ttl=SEC_CACHE_TTL_SECONDS, show_spinner=False)
+def cached_13f_holdings(
+    cik: str, accession_number: str, user_agent: str
+) -> list[dict]:
+    """특정 공시의 보유 종목 목록을 조회하고 결과를 캐시에 보관합니다.
+
+    보유 종목 XML은 기관에 따라 수백~수천 줄이라 가장 무거운 요청입니다.
+    같은 cik·accession_number를 다시 요청하면 SEC XML을 새로 받지 않습니다.
+
+    반환값은 get_13f_holdings와 같은 holdings 목록입니다.
+    (캐시 이름표: cik, accession_number, user_agent)
+    """
+    return get_13f_holdings(cik, accession_number, user_agent=user_agent)
+
+
+def clear_sec_caches() -> None:
+    """위에서 만든 두 SEC 조회 캐시만 비웁니다.
+
+    st.cache_data.clear()로 앱 전체 캐시를 지우지 않습니다. 그래서 운용사 목록
+    (load_managers)처럼 SEC와 무관한 캐시는 그대로 남습니다.
+    """
+    cached_recent_filings.clear()
+    cached_13f_holdings.clear()
+
+
 def read_gemini_settings() -> tuple[str, str]:
     """Gemini 호출에 쓸 API 키와 모델명을 secrets에서 읽어옵니다.
 
@@ -303,6 +375,19 @@ def format_percent(value, digits: int = 2) -> str:
     if value is None or pd.isna(value):
         return "계산 불가"
     return f"{value:+,.{digits}f}%"
+
+
+def table_height(row_count: int) -> int | None:
+    """표에 지정할 높이를 정합니다.
+
+    보유 종목이 많은 기관(예: Bridgewater)은 표가 화면을 끝없이 늘리지 않도록
+    높이를 정해 표 안에서 스크롤되게 합니다. 행이 적으면 None을 돌려주어
+    Streamlit 기본(자동 높이)을 그대로 쓰게 합니다. 어느 쪽이든 행을 잘라내지
+    않으므로 전체 데이터는 그대로 유지됩니다.
+    """
+    if row_count > LARGE_TABLE_ROW_THRESHOLD:
+        return LARGE_TABLE_HEIGHT
+    return None
 
 
 def comparison_column_config() -> dict:
@@ -500,8 +585,15 @@ st.caption(
     "13F-HR은 운용 규모가 큰 기관투자자가 분기마다 제출하는 보유 종목 보고서입니다. "
     "정정 공시(13F-HR/A)는 제외하고 정기 공시만 조회합니다."
 )
+st.caption(
+    f"한 번 불러온 결과는 {SEC_CACHE_TTL_SECONDS // 3600}시간 동안 재사용해 "
+    "SEC 요청을 줄입니다. 최신 상태를 바로 확인하려면 아래 "
+    "'SEC 데이터 새로고침'을 눌러 주세요."
+)
 
-if st.button("최근 13F 공시 조회", type="primary"):
+fetch_column, refresh_column = st.columns([1, 1])
+
+if fetch_column.button("최근 13F 공시 조회", type="primary"):
     # 조회 결과와 오류 메시지를 화면 상태에 보관합니다.
     # 다른 버튼을 눌러 화면이 다시 그려져도 표가 사라지지 않게 하기 위함입니다.
     st.session_state["filings"] = None
@@ -516,10 +608,10 @@ if st.button("최근 13F 공시 조회", type="primary"):
         user_agent = read_sec_user_agent()
 
         with st.spinner("SEC EDGAR에서 공시 목록을 불러오는 중입니다..."):
-            st.session_state["filings"] = get_recent_13f_filings(
+            st.session_state["filings"] = cached_recent_filings(
                 manager["cik"],
-                user_agent=user_agent,
-                limit=FILING_LIMIT,
+                FILING_LIMIT,
+                user_agent,
             )
     except LookupError as error:
         # SEC_USER_AGENT 설정이 없는 경우.
@@ -533,6 +625,15 @@ if st.button("최근 13F 공시 조회", type="primary"):
             "공시 목록을 불러오는 중 예상하지 못한 문제가 발생했습니다. "
             "잠시 후 다시 시도해 주세요."
         )
+
+# 캐시 때문에 옛 데이터가 보일 때 사용자가 직접 다시 받아올 수 있게 하는 버튼입니다.
+# 화면에 이미 나와 있는 표나 기관 선택은 건드리지 않고, 보관해 둔 조회 결과만 비웁니다.
+if refresh_column.button(
+    "SEC 데이터 새로고침",
+    help="보관해 둔 SEC 조회 결과를 비웁니다. 기관 선택과 화면의 분석 결과는 그대로 남습니다.",
+):
+    clear_sec_caches()
+    st.info(CACHE_CLEARED_MESSAGE)
 
 if st.session_state.get("error"):
     st.error(st.session_state["error"])
@@ -582,10 +683,10 @@ else:
             user_agent = read_sec_user_agent()
 
             with st.spinner("SEC EDGAR에서 보유 종목 목록을 불러오는 중입니다..."):
-                st.session_state["holdings"] = get_13f_holdings(
+                st.session_state["holdings"] = cached_13f_holdings(
                     manager["cik"],
                     selected_filing["accession_number"],
-                    user_agent=user_agent,
+                    user_agent,
                 )
         except LookupError as error:
             # SEC_USER_AGENT 설정이 없는 경우.
@@ -652,11 +753,13 @@ elif st.session_state.get("holdings") is not None:
         )
 
         # 4) 보유 종목 전체 표
+        # 종목 수가 많은 기관도 전체를 그대로 담고, 표시 높이만 정해 표 안에서 스크롤됩니다.
         st.markdown("**보유 종목 전체**")
         st.dataframe(
             holdings_table,
             hide_index=True,
             width="stretch",
+            height=table_height(len(holdings_table)),
             column_config={
                 "reported_value": st.column_config.NumberColumn(format="localized"),
                 "shares": st.column_config.NumberColumn(format="localized"),
@@ -668,7 +771,9 @@ elif st.session_state.get("holdings") is not None:
         )
         st.caption(
             "표는 공시 평가금액이 큰 종목부터 정렬했습니다. "
-            "put_call 칸은 옵션 관련 보유일 때만 값이 표시됩니다."
+            "put_call 칸은 옵션 관련 보유일 때만 값이 표시됩니다. "
+            "보유 종목이 많은 기관도 전체 목록을 그대로 담고 있으며, "
+            "표 안에서 스크롤해 확인할 수 있습니다."
         )
 
 st.divider()
@@ -698,10 +803,10 @@ if st.button("두 분기 변화 분석", type="primary"):
         user_agent = read_sec_user_agent()
 
         with st.spinner("SEC EDGAR에서 최근 공시 2건을 불러오는 중입니다..."):
-            recent_filings = get_recent_13f_filings(
+            recent_filings = cached_recent_filings(
                 manager["cik"],
-                user_agent=user_agent,
-                limit=FILING_LIMIT,
+                FILING_LIMIT,
+                user_agent,
             )
 
         if len(recent_filings) < 2:
@@ -715,18 +820,19 @@ if st.button("두 분기 변화 분석", type="primary"):
             current_filing = recent_filings[0]
             previous_filing = recent_filings[1]
 
+            # 위 '보유 종목 조회'에서 이미 불러온 공시라면 캐시에 있는 값을 그대로 씁니다.
             with st.spinner("현재 분기 보유 종목을 불러오는 중입니다..."):
-                current_holdings = get_13f_holdings(
+                current_holdings = cached_13f_holdings(
                     manager["cik"],
                     current_filing["accession_number"],
-                    user_agent=user_agent,
+                    user_agent,
                 )
 
             with st.spinner("이전 분기 보유 종목을 불러오는 중입니다..."):
-                previous_holdings = get_13f_holdings(
+                previous_holdings = cached_13f_holdings(
                     manager["cik"],
                     previous_filing["accession_number"],
-                    user_agent=user_agent,
+                    user_agent,
                 )
 
             with st.spinner("두 분기의 변화를 분석하는 중입니다..."):
@@ -854,6 +960,7 @@ elif st.session_state.get("comparison") is not None:
                         rows[COMPARISON_DISPLAY_COLUMNS],
                         hide_index=True,
                         width="stretch",
+                        height=table_height(len(rows)),
                         column_config=comparison_column_config(),
                     )
 

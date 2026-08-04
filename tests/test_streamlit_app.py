@@ -1,9 +1,14 @@
-"""streamlit_app.py의 기관투자자 선택 관련 기능 테스트.
+"""streamlit_app.py의 기관투자자 선택 및 SEC 조회 캐시 테스트.
 
-실제 화면을 띄우지 않고, 운용사 목록 읽기와 선택 상태 처리만 확인합니다.
+실제 화면을 띄우지 않고, 운용사 목록 읽기와 선택 상태 처리,
+그리고 SEC 조회 캐시 래퍼의 동작만 확인합니다.
 Streamlit 위젯은 `streamlit run` 없이 불러오면 기본값을 돌려주므로,
 이 파일은 모듈을 그대로 import 해서 안에 있는 함수만 검증합니다.
+
+SEC에 실제로 접속하지 않습니다. 조회 함수는 모두 가짜(mock)로 바꿔치기합니다.
 """
+
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -12,12 +17,16 @@ import streamlit_app
 from streamlit_app import (
     ANALYSIS_STATE_KEYS,
     DEFAULT_MANAGER,
+    cached_13f_holdings,
+    cached_recent_filings,
+    clear_sec_caches,
     default_manager_index,
     find_manager,
     load_managers,
     manager_options,
     reset_analysis_state,
     sync_selected_manager,
+    table_height,
 )
 
 # data/managers.csv에 반드시 들어 있어야 하는 기관과 CIK.
@@ -248,3 +257,258 @@ def test_filing_limit_is_unchanged():
     """공시 조회 건수 등 기존 설정은 이번 단계에서 바뀌지 않아야 한다."""
     assert streamlit_app.FILING_LIMIT == 2
     assert streamlit_app.TOP_HOLDINGS_COUNT == 10
+
+
+# ---------------------------------------------------------------------------
+# SEC 조회 캐시
+# ---------------------------------------------------------------------------
+
+# 캐시 테스트에 쓰는 예시 값. 실제 SEC 응답과 같은 구조만 갖추면 됩니다.
+SAMPLE_CIK = "0001067983"
+SAMPLE_USER_AGENT = "Test Runner test@example.com"
+SAMPLE_ACCESSION = "0000950123-25-008888"
+
+SAMPLE_FILINGS = [
+    {
+        "accession_number": SAMPLE_ACCESSION,
+        "filing_date": "2025-02-14",
+        "report_date": "2024-12-31",
+        "primary_document": "primary_doc.xml",
+    },
+    {
+        "accession_number": "0000950123-24-011111",
+        "filing_date": "2024-11-14",
+        "report_date": "2024-09-30",
+        "primary_document": "primary_doc.xml",
+    },
+]
+
+SAMPLE_HOLDINGS = [
+    {
+        "issuer_name": "APPLE INC",
+        "class_title": "COM",
+        "cusip": "037833100",
+        "reported_value": 75000000,
+        "shares": 300000000,
+        "share_type": "SH",
+        "put_call": "",
+    },
+    {
+        "issuer_name": "COCA COLA CO",
+        "class_title": "COM",
+        "cusip": "191216100",
+        "reported_value": 24000000,
+        "shares": 400000000,
+        "share_type": "SH",
+        "put_call": "",
+    },
+]
+
+
+@pytest.fixture(autouse=True)
+def empty_sec_caches():
+    """각 테스트가 빈 캐시에서 시작하고, 끝난 뒤에도 캐시를 남기지 않게 합니다."""
+    clear_sec_caches()
+    yield
+    clear_sec_caches()
+
+
+def test_cache_ttl_is_six_hours():
+    """캐시 유효시간은 6시간이어야 한다."""
+    assert streamlit_app.SEC_CACHE_TTL_SECONDS == 6 * 60 * 60
+
+
+def test_cached_recent_filings_passes_arguments_to_sec_client():
+    """공시 목록 캐시는 cik, limit, user_agent를 SEC 함수에 그대로 넘겨야 한다."""
+    with patch("streamlit_app.get_recent_13f_filings") as mock_get:
+        mock_get.return_value = SAMPLE_FILINGS
+
+        result = cached_recent_filings(SAMPLE_CIK, 2, SAMPLE_USER_AGENT)
+
+    mock_get.assert_called_once_with(SAMPLE_CIK, user_agent=SAMPLE_USER_AGENT, limit=2)
+    # 반환값 구조는 기존 함수와 같은 list[dict]를 유지해야 합니다.
+    assert isinstance(result, list)
+    assert result == SAMPLE_FILINGS
+
+
+def test_cached_recent_filings_reuses_result_for_same_arguments():
+    """같은 인자로 다시 부르면 SEC 함수를 또 호출하지 않아야 한다."""
+    with patch("streamlit_app.get_recent_13f_filings") as mock_get:
+        mock_get.return_value = SAMPLE_FILINGS
+
+        first = cached_recent_filings(SAMPLE_CIK, 2, SAMPLE_USER_AGENT)
+        second = cached_recent_filings(SAMPLE_CIK, 2, SAMPLE_USER_AGENT)
+
+    assert mock_get.call_count == 1
+    assert first == second == SAMPLE_FILINGS
+
+
+@pytest.mark.parametrize(
+    "other_arguments",
+    [
+        ("0001350694", 2, SAMPLE_USER_AGENT),  # 다른 기관
+        (SAMPLE_CIK, 4, SAMPLE_USER_AGENT),  # 다른 조회 건수
+        (SAMPLE_CIK, 2, "Other Runner other@example.com"),  # 다른 User-Agent
+    ],
+)
+def test_cached_recent_filings_refetches_when_any_key_differs(other_arguments):
+    """cik, limit, user_agent 중 하나만 달라도 SEC에 새로 요청해야 한다."""
+    with patch("streamlit_app.get_recent_13f_filings") as mock_get:
+        mock_get.return_value = SAMPLE_FILINGS
+
+        cached_recent_filings(SAMPLE_CIK, 2, SAMPLE_USER_AGENT)
+        cached_recent_filings(*other_arguments)
+
+    assert mock_get.call_count == 2
+
+
+def test_cached_13f_holdings_passes_arguments_to_sec_client():
+    """보유 종목 캐시는 cik, accession_number, user_agent를 그대로 넘겨야 한다."""
+    with patch("streamlit_app.get_13f_holdings") as mock_get:
+        mock_get.return_value = SAMPLE_HOLDINGS
+
+        result = cached_13f_holdings(SAMPLE_CIK, SAMPLE_ACCESSION, SAMPLE_USER_AGENT)
+
+    mock_get.assert_called_once_with(
+        SAMPLE_CIK, SAMPLE_ACCESSION, user_agent=SAMPLE_USER_AGENT
+    )
+    # 반환값은 기존 holdings 목록 구조를 그대로 유지해야 합니다.
+    assert isinstance(result, list)
+    assert result == SAMPLE_HOLDINGS
+
+
+def test_cached_13f_holdings_does_not_refetch_same_filing():
+    """같은 CIK·accession_number를 다시 요청하면 SEC XML을 재호출하지 않아야 한다."""
+    with patch("streamlit_app.get_13f_holdings") as mock_get:
+        mock_get.return_value = SAMPLE_HOLDINGS
+
+        first = cached_13f_holdings(SAMPLE_CIK, SAMPLE_ACCESSION, SAMPLE_USER_AGENT)
+        second = cached_13f_holdings(SAMPLE_CIK, SAMPLE_ACCESSION, SAMPLE_USER_AGENT)
+
+    assert mock_get.call_count == 1
+    assert first == second == SAMPLE_HOLDINGS
+
+
+def test_cached_13f_holdings_refetches_for_other_accession_number():
+    """다른 공시(분기)를 요청하면 그 공시는 새로 받아와야 한다."""
+    with patch("streamlit_app.get_13f_holdings") as mock_get:
+        mock_get.return_value = SAMPLE_HOLDINGS
+
+        cached_13f_holdings(SAMPLE_CIK, SAMPLE_ACCESSION, SAMPLE_USER_AGENT)
+        cached_13f_holdings(SAMPLE_CIK, "0000950123-24-011111", SAMPLE_USER_AGENT)
+
+    assert mock_get.call_count == 2
+
+
+def test_two_quarter_comparison_reuses_holdings_already_fetched():
+    """단일 공시 조회와 두 분기 비교가 같은 캐시를 쓰는지 확인한다.
+
+    '보유 종목 조회'로 최신 공시를 본 뒤 '두 분기 변화 분석'을 하면,
+    최신 공시는 캐시에 있으므로 이전 분기 공시만 새로 받아와야 합니다.
+    """
+    current = SAMPLE_FILINGS[0]["accession_number"]
+    previous = SAMPLE_FILINGS[1]["accession_number"]
+
+    with patch("streamlit_app.get_13f_holdings") as mock_get:
+        mock_get.return_value = SAMPLE_HOLDINGS
+
+        # 1) 단일 공시 조회
+        cached_13f_holdings(SAMPLE_CIK, current, SAMPLE_USER_AGENT)
+        # 2) 두 분기 비교
+        cached_13f_holdings(SAMPLE_CIK, current, SAMPLE_USER_AGENT)
+        cached_13f_holdings(SAMPLE_CIK, previous, SAMPLE_USER_AGENT)
+
+    # 공시 3번 요청했지만 서로 다른 공시는 2건이므로 SEC 호출도 2번이어야 합니다.
+    assert mock_get.call_count == 2
+    requested = [call.args[1] for call in mock_get.call_args_list]
+    assert requested == [current, previous]
+
+
+# ---------------------------------------------------------------------------
+# 캐시 초기화
+# ---------------------------------------------------------------------------
+
+
+def test_clear_sec_caches_forces_new_filings_request():
+    """캐시를 비우면 공시 목록을 SEC에서 다시 받아와야 한다."""
+    with patch("streamlit_app.get_recent_13f_filings") as mock_get:
+        mock_get.return_value = SAMPLE_FILINGS
+
+        cached_recent_filings(SAMPLE_CIK, 2, SAMPLE_USER_AGENT)
+        clear_sec_caches()
+        cached_recent_filings(SAMPLE_CIK, 2, SAMPLE_USER_AGENT)
+
+    assert mock_get.call_count == 2
+
+
+def test_clear_sec_caches_forces_new_holdings_request():
+    """캐시를 비우면 보유 종목도 SEC에서 다시 받아와야 한다."""
+    with patch("streamlit_app.get_13f_holdings") as mock_get:
+        mock_get.return_value = SAMPLE_HOLDINGS
+
+        cached_13f_holdings(SAMPLE_CIK, SAMPLE_ACCESSION, SAMPLE_USER_AGENT)
+        clear_sec_caches()
+        cached_13f_holdings(SAMPLE_CIK, SAMPLE_ACCESSION, SAMPLE_USER_AGENT)
+
+    assert mock_get.call_count == 2
+
+
+def test_clear_sec_caches_keeps_manager_list_cache(monkeypatch):
+    """캐시 초기화는 SEC 조회 캐시만 비우고 운용사 목록 캐시는 남겨야 한다.
+
+    앱 전체 캐시(st.cache_data.clear())를 지우지 않는다는 것을 확인하기 위해,
+    운용사 목록을 한 번 읽어 캐시에 담은 뒤 파일 읽기를 실패하게 만들어 둡니다.
+    캐시가 남아 있다면 파일을 다시 읽지 않으므로 오류 없이 값을 돌려줍니다.
+    """
+    load_managers.clear()
+    before = load_managers()
+
+    def fail_to_read(*args, **kwargs):
+        raise AssertionError("운용사 목록 캐시가 지워져 파일을 다시 읽으려 했습니다.")
+
+    monkeypatch.setattr(pd, "read_csv", fail_to_read)
+
+    clear_sec_caches()
+
+    assert load_managers().equals(before)
+
+
+# ---------------------------------------------------------------------------
+# 행이 많은 표 표시
+# ---------------------------------------------------------------------------
+
+
+def test_table_height_is_limited_for_many_rows():
+    """보유 종목이 많으면(예: Bridgewater) 표 높이를 정해 스크롤되게 한다."""
+    assert table_height(1000) == streamlit_app.LARGE_TABLE_HEIGHT
+    assert table_height(streamlit_app.LARGE_TABLE_ROW_THRESHOLD + 1) == (
+        streamlit_app.LARGE_TABLE_HEIGHT
+    )
+
+
+def test_table_height_is_automatic_for_few_rows():
+    """행이 적으면 높이를 정하지 않아 표 아래에 빈 공간이 생기지 않는다."""
+    assert table_height(0) is None
+    assert table_height(streamlit_app.LARGE_TABLE_ROW_THRESHOLD) is None
+
+
+def test_cache_cleared_message_tells_user_to_search_again():
+    """캐시 초기화 뒤에는 다시 조회해야 한다는 안내가 있어야 한다."""
+    message = streamlit_app.CACHE_CLEARED_MESSAGE
+
+    assert "캐시" in message
+    assert "다시" in message
+
+
+def test_cache_reset_does_not_touch_analysis_state():
+    """캐시 초기화 대상에 화면 상태 키가 섞여 들어가지 않아야 한다.
+
+    기관 선택이나 이미 화면에 나온 분석 결과는 캐시 초기화로 지우지 않습니다.
+    """
+    state = filled_state()
+
+    clear_sec_caches()
+
+    assert state["active_manager_name"] == "Berkshire Hathaway"
+    for key in EXPECTED_RESET_KEYS:
+        assert state[key] is not None
