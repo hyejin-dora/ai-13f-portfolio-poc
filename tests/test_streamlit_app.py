@@ -487,9 +487,50 @@ def test_table_height_is_limited_for_many_rows():
 
 
 def test_table_height_is_automatic_for_few_rows():
-    """행이 적으면 높이를 정하지 않아 표 아래에 빈 공간이 생기지 않는다."""
-    assert table_height(0) is None
-    assert table_height(streamlit_app.LARGE_TABLE_ROW_THRESHOLD) is None
+    """행이 적으면 내용에 맞춘 높이를 써서 표 아래에 빈 공간이 생기지 않는다."""
+    assert table_height(0) == streamlit_app.AUTO_TABLE_HEIGHT
+    assert table_height(streamlit_app.LARGE_TABLE_ROW_THRESHOLD) == (
+        streamlit_app.AUTO_TABLE_HEIGHT
+    )
+
+
+def _assert_valid_streamlit_height(value):
+    """Streamlit이 표 높이로 허용하는 값(양의 정수, "content", "stretch")인지 확인한다."""
+    assert value is not None
+    if isinstance(value, str):
+        assert value in {"content", "stretch"}
+    else:
+        assert isinstance(value, int) and not isinstance(value, bool)
+        assert value > 0
+
+
+def test_table_height_never_returns_none_for_empty_table():
+    """0행(조회 결과가 없는 표)이어도 None이 아니라 유효한 높이를 준다."""
+    _assert_valid_streamlit_height(table_height(0))
+
+
+def test_table_height_never_returns_none_for_single_row():
+    """1행짜리 표도 None이 아니라 유효한 높이를 준다."""
+    _assert_valid_streamlit_height(table_height(1))
+
+
+def test_table_height_is_valid_for_small_tables():
+    """행이 적은 구간 전체에서 유효한 높이를 준다."""
+    for row_count in range(0, streamlit_app.LARGE_TABLE_ROW_THRESHOLD + 1):
+        _assert_valid_streamlit_height(table_height(row_count))
+
+
+def test_table_height_is_positive_integer_for_large_tables():
+    """행이 많으면 양의 정수(픽셀) 높이를 주어 표 안에서 스크롤되게 한다."""
+    for row_count in (
+        streamlit_app.LARGE_TABLE_ROW_THRESHOLD + 1,
+        200,
+        5000,
+    ):
+        height = table_height(row_count)
+        _assert_valid_streamlit_height(height)
+        assert isinstance(height, int)
+        assert height > 0
 
 
 def test_cache_cleared_message_tells_user_to_search_again():

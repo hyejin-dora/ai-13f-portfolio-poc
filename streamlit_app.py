@@ -74,9 +74,14 @@ SEC_CACHE_TTL_SECONDS = 6 * 60 * 60
 # 높이를 정해 두면 표 안에서만 스크롤되어 화면이 지나치게 길어지지 않습니다.
 LARGE_TABLE_HEIGHT = 520
 
-# 몇 행을 넘을 때부터 위 높이를 적용할지. 이보다 적으면 높이를 정하지 않아
-# (자동 높이) 표 아래에 빈 공간이 생기지 않습니다.
+# 몇 행을 넘을 때부터 위 높이를 적용할지. 이보다 적으면 내용에 맞춘 높이를 써서
+# 표 아래에 빈 공간이 생기지 않습니다.
 LARGE_TABLE_ROW_THRESHOLD = 15
+
+# 내용에 맞춰 높이를 정하라는 Streamlit 설정값.
+# Streamlit은 표 높이로 양의 정수, "content", "stretch"만 허용합니다.
+# (예전처럼 None을 넘기면 StreamlitInvalidHeightError가 납니다.)
+AUTO_TABLE_HEIGHT = "content"
 
 # 캐시를 비운 뒤 사용자에게 보여 줄 안내 문구.
 CACHE_CLEARED_MESSAGE = (
@@ -377,17 +382,27 @@ def format_percent(value, digits: int = 2) -> str:
     return f"{value:+,.{digits}f}%"
 
 
-def table_height(row_count: int) -> int | None:
+def table_height(row_count: int) -> int | str:
     """표에 지정할 높이를 정합니다.
 
     보유 종목이 많은 기관(예: Bridgewater)은 표가 화면을 끝없이 늘리지 않도록
-    높이를 정해 표 안에서 스크롤되게 합니다. 행이 적으면 None을 돌려주어
-    Streamlit 기본(자동 높이)을 그대로 쓰게 합니다. 어느 쪽이든 행을 잘라내지
-    않으므로 전체 데이터는 그대로 유지됩니다.
+    높이(양의 정수, 픽셀)를 정해 표 안에서 스크롤되게 합니다. 행이 적으면
+    "content"를 돌려주어 내용에 맞춘 높이를 쓰게 합니다.
+
+    Streamlit이 허용하는 값은 양의 정수, "content", "stretch"뿐이므로 어떤
+    입력에서도 None을 돌려주지 않습니다. 행 개수가 숫자가 아니거나 비어 있어도
+    "content"로 안전하게 처리합니다.
+
+    어느 쪽이든 행을 잘라내지 않으므로 전체 데이터는 그대로 유지됩니다.
     """
-    if row_count > LARGE_TABLE_ROW_THRESHOLD:
+    try:
+        rows = int(row_count)
+    except (TypeError, ValueError):
+        return AUTO_TABLE_HEIGHT
+
+    if rows > LARGE_TABLE_ROW_THRESHOLD:
         return LARGE_TABLE_HEIGHT
-    return None
+    return AUTO_TABLE_HEIGHT
 
 
 def comparison_column_config() -> dict:
