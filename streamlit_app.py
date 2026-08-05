@@ -18,6 +18,16 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from services.institution_comparison import (
+    HOLDING_TYPE,
+    HOLDING_TYPE_COMMON,
+    HOLDING_TYPE_LEFT_ONLY,
+    HOLDING_TYPE_RIGHT_ONLY,
+    compare_institution_portfolios,
+    find_common_report_dates,
+    index_filings_by_report_date,
+    summarize_institution_comparison,
+)
 from services.llm_client import (
     LlmApiError,
     build_briefing_prompt,
@@ -61,6 +71,35 @@ ANALYSIS_STATE_KEYS = (
 
 # 조회할 공시 건수.
 FILING_LIMIT = 2
+
+# 기관 간 비교 화면에서 기관별로 조회할 공시 건수.
+# 기관마다 13F 제출을 시작한 시점과 제출 주기가 달라, 최근 2건만 보면 두 기관이
+# 함께 공시한 분기(report_date)를 못 찾을 수 있습니다. 그래서 이 화면에서만
+# 조회 범위를 넓혀 최근 8건 안에서 공통 분기를 찾습니다.
+# (위 FILING_LIMIT과 단일 기관 분석 동작은 그대로 둡니다.)
+INSTITUTION_COMPARISON_FILING_LIMIT = 8
+
+# 기관 간 비교 화면에서 기본으로 선택되는 두 기관.
+# 목록에 없으면 아래 institution_default_index가 다른 기관으로 대체합니다.
+DEFAULT_LEFT_INSTITUTION = DEFAULT_MANAGER
+DEFAULT_RIGHT_INSTITUTION = "Pershing Square Capital Management"
+
+# 기관 간 비교 화면에서만 쓰는 화면 상태 키.
+# 위 ANALYSIS_STATE_KEYS(단일 기관 분석)와 겹치지 않게 이름을 나누어 두었기 때문에,
+# 비교할 기관을 바꿔도 단일 기관 분석 결과는 지워지지 않습니다.
+INSTITUTION_COMPARISON_STATE_KEYS = (
+    "institution_common_dates",
+    "institution_left_filings_by_date",
+    "institution_right_filings_by_date",
+    "institution_selected_report_date",
+    "institution_comparison",
+    "institution_comparison_summary",
+    "institution_comparison_filings",
+    "institution_comparison_error",
+    "institution_comparison_warning",
+    "institution_comparison_left_name",
+    "institution_comparison_right_name",
+)
 
 # 비중 상위 몇 개 종목을 따로 보여줄지.
 TOP_HOLDINGS_COUNT = 10
@@ -144,6 +183,33 @@ COMPARISON_DISPLAY_COLUMNS = [
     "weight_change_pct_point",
     "change_status",
 ]
+
+# 기관 간 비교 표에 보여 줄 열 순서.
+# 금액은 기관마다 규모가 달라 그대로 비교하기 어려우므로, 비중(%)과 비중 차이(%포인트)를
+# 함께 두어 규모와 관계없이 견줄 수 있게 합니다. 내부 식별용 position_key는 넣지 않습니다.
+INSTITUTION_DISPLAY_COLUMNS = [
+    "issuer_name",
+    "cusip",
+    "put_call",
+    "share_type",
+    "left_reported_value",
+    "right_reported_value",
+    "left_weight_pct",
+    "right_weight_pct",
+    "weight_gap_pct_point",
+]
+
+# 기관 간 비교 화면에서 탭으로 나눌 보유 유형 순서.
+INSTITUTION_HOLDING_TYPE_ORDER = [
+    HOLDING_TYPE_COMMON,
+    HOLDING_TYPE_LEFT_ONLY,
+    HOLDING_TYPE_RIGHT_ONLY,
+]
+
+# 기관 이름을 지표·탭 제목에 넣을 때 쓰는 최대 길이(글자).
+# 이보다 길면 앞쪽 단어만 남깁니다(예: "Berkshire Hathaway" -> "Berkshire").
+# 전체 기관명은 비교 화면 위쪽에 따로 표시하므로 정보가 사라지지 않습니다.
+INSTITUTION_LABEL_MAX_LENGTH = 16
 
 # 분기 비교 화면에서 탭으로 나눌 변화 구분 순서.
 CHANGE_STATUS_ORDER = [
@@ -448,6 +514,204 @@ def comparison_column_config() -> dict:
             help="비중 변화 (%포인트)", format="%+.2f"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# 기관 간 동일 분기 비교 도우미
+#
+# 계산은 services/institution_comparison.py가 모두 맡고, 아래 함수들은 그 결과를
+# 화면에 어떻게 보여 줄지(기본 선택값, 상태 초기화, 표시 형식)만 정합니다.
+# ---------------------------------------------------------------------------
+
+
+def institution_default_index(names: list[str], preferred: str, avoid: str = "") -> int:
+    """비교 화면 선택 상자의 기본 선택 위치를 돌려줍니다.
+
+    기본 기관이 목록에 없으면, 반대쪽 기본 기관(avoid)과 다른 첫 번째 기관을 고릅니다.
+    두 선택 상자가 처음부터 같은 기관을 가리키지 않게 하기 위함입니다.
+    """
+    if preferred in names:
+        return names.index(preferred)
+
+    for index, name in enumerate(names):
+        if name != avoid:
+            return index
+
+    return 0
+
+
+def can_compare_institutions(left_name, right_name) -> bool:
+    """두 기관을 비교할 수 있는 조합인지 확인합니다.
+
+    같은 기관끼리는 비교할 내용이 없고(모든 종목이 공통 보유가 됩니다),
+    기관을 고르지 않은 상태에서도 비교를 실행하지 않습니다.
+    """
+    left = str(left_name or "").strip()
+    right = str(right_name or "").strip()
+
+    return bool(left) and bool(right) and left != right
+
+
+def reset_institution_comparison_state(state) -> None:
+    """기관 간 비교 화면의 결과만 지웁니다.
+
+    지우는 대상은 INSTITUTION_COMPARISON_STATE_KEYS뿐이므로, 위쪽 단일 기관
+    분석 결과(공시 목록, 보유 종목, 두 분기 비교, AI 브리핑)는 그대로 남습니다.
+    """
+    for key in INSTITUTION_COMPARISON_STATE_KEYS:
+        state[key] = None
+
+
+def sync_institution_pair(state, left_name: str, right_name: str) -> bool:
+    """비교할 두 기관이 직전과 달라졌으면 비교 결과를 지웁니다.
+
+    화면은 버튼을 누를 때마다 처음부터 다시 실행되므로, '직전에 고른 두 기관'을
+    따로 기억해 두고 그 값과 비교합니다. 같은 조합이면 아무것도 지우지 않습니다.
+
+    Returns:
+        기관 조합이 바뀌어서 결과를 지웠으면 True, 그대로 두었으면 False.
+    """
+    pair = (left_name, right_name)
+
+    if state.get("active_institution_pair") == pair:
+        return False
+
+    reset_institution_comparison_state(state)
+    state["active_institution_pair"] = pair
+    return True
+
+
+def short_institution_name(
+    name, max_length: int = INSTITUTION_LABEL_MAX_LENGTH
+) -> str:
+    """지표·탭 제목에 넣을 짧은 기관 이름을 만듭니다.
+
+    이름이 길면 최대 길이를 넘지 않는 만큼 앞쪽 단어만 남깁니다
+    (예: "Pershing Square Capital Management" -> "Pershing Square").
+    전체 기관명은 비교 화면 위쪽에 따로 표시하므로 정보가 사라지지 않습니다.
+    """
+    text = str(name or "").strip()
+    if len(text) <= max_length:
+        return text
+
+    shortened = ""
+    for word in text.split():
+        candidate = f"{shortened} {word}".strip()
+        if shortened and len(candidate) > max_length:
+            break
+        shortened = candidate
+
+    # 첫 단어 하나가 이미 최대 길이보다 길면 글자 수로 잘라 냅니다.
+    return shortened or text[:max_length]
+
+
+def format_overlap_percent(value, digits: int = 1) -> str:
+    """중복률·중복도를 화면에 표시할 문자열로 바꿉니다.
+
+    증감이 아니라 '전체 중 몇 %'를 나타내는 값이므로 부호(+)를 붙이지 않습니다.
+    계산할 수 없는 값은 안내 문구로 바꿉니다.
+    """
+    if value is None or pd.isna(value):
+        return "계산 불가"
+    return f"{float(value):,.{digits}f}%"
+
+
+def institution_filing_for_date(filings_by_date, report_date) -> dict:
+    """기준일로 정리해 둔 공시 목록에서 해당 분기의 공시 한 건을 꺼냅니다.
+
+    같은 기준일에 여러 건이 있을 때 어느 것을 쓸지는
+    institution_comparison.index_filings_by_report_date의 기준을 그대로 따릅니다.
+    찾지 못하면 빈 딕셔너리를 돌려주어 화면이 멈추지 않게 합니다.
+    """
+    if not isinstance(filings_by_date, dict) or not report_date:
+        return {}
+
+    filing = filings_by_date.get(report_date)
+    return filing if isinstance(filing, dict) else {}
+
+
+def format_institution_filing_summary(label: str, filing: dict) -> str:
+    """비교 대상 공시의 접수번호와 제출일을 간단히 보여 줄 문구를 만듭니다."""
+    filing = filing or {}
+    return (
+        f"{label}\n\n"
+        f"- 접수번호(accession_number): `{filing.get('accession_number', '-')}`\n"
+        f"- 제출일(filing_date): `{filing.get('filing_date', '-')}`"
+    )
+
+
+def institution_rows_by_type(comparison, holding_type: str) -> pd.DataFrame:
+    """비교 결과에서 한 가지 보유 유형(공통/기관 A 단독/기관 B 단독)만 골라냅니다.
+
+    결과가 없거나 유형 열이 없어도 오류 없이 빈 표를 돌려줍니다.
+    """
+    if comparison is None or len(comparison) == 0:
+        return pd.DataFrame(columns=INSTITUTION_DISPLAY_COLUMNS)
+
+    if HOLDING_TYPE not in comparison.columns:
+        return pd.DataFrame(columns=INSTITUTION_DISPLAY_COLUMNS)
+
+    return comparison[comparison[HOLDING_TYPE] == holding_type]
+
+
+def institution_column_config() -> dict:
+    """기관 간 비교 표의 한국어 열 제목과 숫자 표시 형식을 정합니다.
+
+    열 제목에 기관명을 반복하지 않고 '기관 A / 기관 B'로 표시합니다.
+    어느 기관이 A이고 B인지는 표 위쪽에서 전체 이름으로 보여 줍니다.
+    """
+    return {
+        "issuer_name": st.column_config.TextColumn("종목명"),
+        "cusip": st.column_config.TextColumn("CUSIP"),
+        "put_call": st.column_config.TextColumn(
+            "옵션 구분",
+            help="값이 있으면 Put/Call 보유이고, 비어 있으면 일반 주식 보유입니다.",
+        ),
+        "share_type": st.column_config.TextColumn(
+            "수량 단위", help="SH=주식 수, PRN=원금액"
+        ),
+        "left_reported_value": st.column_config.NumberColumn(
+            "기관 A 공시 평가금액",
+            help="SEC Information Table의 reported value 필드 (환산하지 않은 공시 원문 값)",
+            format="localized",
+        ),
+        "right_reported_value": st.column_config.NumberColumn(
+            "기관 B 공시 평가금액",
+            help="SEC Information Table의 reported value 필드 (환산하지 않은 공시 원문 값)",
+            format="localized",
+        ),
+        "left_weight_pct": st.column_config.NumberColumn(
+            "기관 A 비중", help="기관 A 포트폴리오에서 차지하는 비율(%)", format="%.2f%%"
+        ),
+        "right_weight_pct": st.column_config.NumberColumn(
+            "기관 B 비중", help="기관 B 포트폴리오에서 차지하는 비율(%)", format="%.2f%%"
+        ),
+        "weight_gap_pct_point": st.column_config.NumberColumn(
+            "비중 차이(%p)",
+            help="기관 A 비중 - 기관 B 비중 (%포인트). 양수면 기관 A가 더 많이 담은 종목입니다.",
+            format="%+.2f",
+        ),
+    }
+
+
+def render_institution_holdings_table(rows) -> None:
+    """기관 간 비교 결과 표 하나를 화면에 그립니다.
+
+    비어 있으면 표를 그리지 않고 안내 문구만 보여 줍니다. 표를 그릴 때는
+    height에 항상 table_height()의 결과(양의 정수 또는 "content")를 넘기므로
+    None이 전달되어 생기던 StreamlitInvalidHeightError가 나지 않습니다.
+    """
+    if rows is None or len(rows) == 0:
+        st.info("해당 종목이 없습니다.")
+        return
+
+    st.dataframe(
+        rows[INSTITUTION_DISPLAY_COLUMNS],
+        hide_index=True,
+        width="stretch",
+        height=table_height(len(rows)),
+        column_config=institution_column_config(),
+    )
 
 
 def top_weight_changes(comparison: pd.DataFrame) -> pd.DataFrame:
@@ -1061,6 +1325,366 @@ else:
             "내용에 사실과 다른 부분이 있을 수 있으니 위의 표와 숫자를 함께 확인해 주세요."
         )
         st.markdown(st.session_state["ai_briefing"])
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 기관 간 동일 분기 비교
+#
+# 위쪽 단일 기관 분석과는 완전히 별개의 화면입니다. 선택하는 기관도, 화면 상태 키도
+# 나누어 두었기 때문에 여기서 기관을 바꿔도 위쪽 결과는 그대로 남습니다.
+# ---------------------------------------------------------------------------
+
+st.subheader("기관 간 동일 분기 비교")
+st.caption(
+    "두 기관이 동일한 기준일(report_date)에 보고한 13F 포트폴리오를 비교합니다."
+)
+st.caption(
+    "기관마다 13F 제출 시점이 달라 제출일(filing_date)이 아닌 "
+    f"기준일(report_date)로 짝을 맞춥니다. 공통 분기는 기관별 최근 공시 "
+    f"{INSTITUTION_COMPARISON_FILING_LIMIT}건 범위에서 찾습니다."
+)
+
+institution_left_column, institution_right_column = st.columns(2)
+
+left_institution_name = institution_left_column.selectbox(
+    "기관 A",
+    options=manager_names,
+    index=institution_default_index(manager_names, DEFAULT_LEFT_INSTITUTION),
+    key="institution_left_manager",
+)
+right_institution_name = institution_right_column.selectbox(
+    "기관 B",
+    options=manager_names,
+    index=institution_default_index(
+        manager_names, DEFAULT_RIGHT_INSTITUTION, avoid=DEFAULT_LEFT_INSTITUTION
+    ),
+    key="institution_right_manager",
+)
+
+# 두 기관 중 하나라도 바뀌면 이전 비교 결과만 지웁니다.
+sync_institution_pair(
+    st.session_state, left_institution_name, right_institution_name
+)
+
+# 같은 기관을 고르면 비교를 진행하지 않습니다(모든 종목이 공통 보유가 되어 의미가 없습니다).
+left_institution = None
+right_institution = None
+
+if not can_compare_institutions(left_institution_name, right_institution_name):
+    st.warning(
+        "기관 A와 기관 B가 같습니다. 서로 다른 두 기관을 선택하면 비교할 수 있습니다."
+    )
+else:
+    try:
+        left_institution = find_manager(managers, left_institution_name)
+        right_institution = find_manager(managers, right_institution_name)
+    except (LookupError, KeyError) as error:
+        st.error(str(error))
+
+if left_institution is not None and right_institution is not None:
+    name_left_column, name_right_column = st.columns(2)
+    name_left_column.markdown(
+        f"기관 A\n\n**{left_institution['name']}** (CIK {left_institution['cik']})"
+    )
+    name_right_column.markdown(
+        f"기관 B\n\n**{right_institution['name']}** (CIK {right_institution['cik']})"
+    )
+
+    # --- 1단계: 두 기관이 함께 공시한 분기 찾기 ----------------------------
+    # 버튼을 눌렀을 때만 SEC에 요청합니다. 화면이 다시 그려질 때 자동으로
+    # 반복 조회하지 않게 하기 위함입니다.
+    if st.button("공통 비교 분기 조회", key="institution_common_dates_button"):
+        reset_institution_comparison_state(st.session_state)
+
+        try:
+            # User-Agent는 여기서 읽어 조회 함수에만 넘깁니다. 화면에 표시하지 않습니다.
+            user_agent = read_sec_user_agent()
+
+            with st.spinner("두 기관의 최근 13F 공시 목록을 불러오는 중입니다..."):
+                # 위쪽 화면과 같은 캐시 함수를 씁니다. SEC 조회를 직접 하지 않습니다.
+                left_filings = cached_recent_filings(
+                    left_institution["cik"],
+                    INSTITUTION_COMPARISON_FILING_LIMIT,
+                    user_agent,
+                )
+                right_filings = cached_recent_filings(
+                    right_institution["cik"],
+                    INSTITUTION_COMPARISON_FILING_LIMIT,
+                    user_agent,
+                )
+
+            st.session_state["institution_left_filings_by_date"] = (
+                index_filings_by_report_date(left_filings)
+            )
+            st.session_state["institution_right_filings_by_date"] = (
+                index_filings_by_report_date(right_filings)
+            )
+            st.session_state["institution_common_dates"] = find_common_report_dates(
+                left_filings, right_filings
+            )
+            st.session_state["institution_comparison_left_name"] = left_institution[
+                "name"
+            ]
+            st.session_state["institution_comparison_right_name"] = right_institution[
+                "name"
+            ]
+        except LookupError as error:
+            # SEC_USER_AGENT 설정이 없는 경우.
+            st.session_state["institution_comparison_error"] = str(error)
+        except (SecApiError, ValueError) as error:
+            # sec_client가 만들어 준 한국어 안내 메시지를 그대로 보여줍니다.
+            st.session_state["institution_comparison_error"] = str(error)
+        except Exception:
+            # 예상하지 못한 오류. 내부 정보가 새지 않도록 상세 내용은 보여주지 않습니다.
+            st.session_state["institution_comparison_error"] = (
+                "공통 비교 분기를 찾는 중 예상하지 못한 문제가 발생했습니다. "
+                "잠시 후 다시 시도해 주세요."
+            )
+
+    if st.session_state.get("institution_comparison_error"):
+        st.error(st.session_state["institution_comparison_error"])
+
+    institution_common_dates = st.session_state.get("institution_common_dates")
+
+    if institution_common_dates is None:
+        st.info(
+            "위의 '공통 비교 분기 조회' 버튼을 눌러 두 기관이 함께 공시한 분기를 "
+            "먼저 찾아 주세요."
+        )
+    elif not institution_common_dates:
+        st.warning(
+            f"{left_institution['name']}과 {right_institution['name']}이 함께 공시한 "
+            f"기준일을 최근 {INSTITUTION_COMPARISON_FILING_LIMIT}건 범위에서 찾지 "
+            "못했습니다. 다른 기관 조합으로 시도해 주세요."
+        )
+    else:
+        # --- 2단계: 비교할 공통 기준일 고르기 -----------------------------
+        # 목록은 find_common_report_dates가 최신순으로 돌려줍니다.
+        selected_report_date = st.selectbox(
+            "비교할 기준일(report_date)을 선택하세요",
+            options=institution_common_dates,
+            key="institution_report_date_choice",
+        )
+
+        left_comparison_filing = institution_filing_for_date(
+            st.session_state.get("institution_left_filings_by_date"),
+            selected_report_date,
+        )
+        right_comparison_filing = institution_filing_for_date(
+            st.session_state.get("institution_right_filings_by_date"),
+            selected_report_date,
+        )
+
+        filing_left_column, filing_right_column = st.columns(2)
+        filing_left_column.markdown(
+            format_institution_filing_summary(
+                f"기관 A · {short_institution_name(left_institution['name'])}",
+                left_comparison_filing,
+            )
+        )
+        filing_right_column.markdown(
+            format_institution_filing_summary(
+                f"기관 B · {short_institution_name(right_institution['name'])}",
+                right_comparison_filing,
+            )
+        )
+
+        # --- 3단계: 보유 종목을 불러와 비교 실행 ---------------------------
+        if st.button(
+            "기관 포트폴리오 비교",
+            type="primary",
+            key="institution_compare_button",
+        ):
+            st.session_state["institution_comparison"] = None
+            st.session_state["institution_comparison_summary"] = None
+            st.session_state["institution_comparison_error"] = None
+            st.session_state["institution_comparison_warning"] = None
+            st.session_state["institution_selected_report_date"] = selected_report_date
+            st.session_state["institution_comparison_filings"] = {
+                "left": left_comparison_filing,
+                "right": right_comparison_filing,
+            }
+            st.session_state["institution_comparison_left_name"] = left_institution[
+                "name"
+            ]
+            st.session_state["institution_comparison_right_name"] = right_institution[
+                "name"
+            ]
+
+            if not left_comparison_filing.get(
+                "accession_number"
+            ) or not right_comparison_filing.get("accession_number"):
+                st.session_state["institution_comparison_warning"] = (
+                    "선택한 기준일의 공시 정보를 찾지 못했습니다. "
+                    "'공통 비교 분기 조회'를 다시 눌러 주세요."
+                )
+            else:
+                try:
+                    # User-Agent는 여기서 읽어 조회 함수에만 넘깁니다.
+                    user_agent = read_sec_user_agent()
+
+                    # 보유 종목도 위쪽 화면과 같은 캐시 함수를 씁니다.
+                    with st.spinner("기관 A의 보유 종목을 불러오는 중입니다..."):
+                        left_institution_holdings = cached_13f_holdings(
+                            left_institution["cik"],
+                            left_comparison_filing["accession_number"],
+                            user_agent,
+                        )
+
+                    with st.spinner("기관 B의 보유 종목을 불러오는 중입니다..."):
+                        right_institution_holdings = cached_13f_holdings(
+                            right_institution["cik"],
+                            right_comparison_filing["accession_number"],
+                            user_agent,
+                        )
+
+                    with st.spinner("두 기관의 포트폴리오를 비교하는 중입니다..."):
+                        institution_result = compare_institution_portfolios(
+                            left_institution_holdings, right_institution_holdings
+                        )
+                        st.session_state["institution_comparison"] = institution_result
+                        st.session_state["institution_comparison_summary"] = (
+                            summarize_institution_comparison(institution_result)
+                        )
+                except LookupError as error:
+                    # SEC_USER_AGENT 설정이 없는 경우.
+                    st.session_state["institution_comparison_error"] = str(error)
+                except (SecApiError, ValueError) as error:
+                    # sec_client가 만들어 준 한국어 안내 메시지를 그대로 보여줍니다.
+                    st.session_state["institution_comparison_error"] = str(error)
+                except Exception:
+                    # 예상하지 못한 오류. 상세 내용은 보여주지 않습니다.
+                    st.session_state["institution_comparison_error"] = (
+                        "두 기관을 비교하는 중 예상하지 못한 문제가 발생했습니다. "
+                        "잠시 후 다시 시도해 주세요."
+                    )
+
+        # --- 4단계: 비교 결과 표시 ----------------------------------------
+        if st.session_state.get("institution_comparison_warning"):
+            st.warning(st.session_state["institution_comparison_warning"])
+        elif st.session_state.get("institution_comparison") is not None:
+            institution_comparison = st.session_state["institution_comparison"]
+            institution_summary = (
+                st.session_state.get("institution_comparison_summary") or {}
+            )
+            compared_left_name = (
+                st.session_state.get("institution_comparison_left_name") or "기관 A"
+            )
+            compared_right_name = (
+                st.session_state.get("institution_comparison_right_name") or "기관 B"
+            )
+            compared_report_date = (
+                st.session_state.get("institution_selected_report_date") or "-"
+            )
+
+            if len(institution_comparison) == 0:
+                st.warning(
+                    "두 공시 모두에서 보유 종목을 찾지 못해 비교할 내용이 없습니다. "
+                    "다른 기준일을 선택해 다시 시도해 주세요."
+                )
+            else:
+                short_left = short_institution_name(compared_left_name)
+                short_right = short_institution_name(compared_right_name)
+
+                st.success(
+                    f"기준일(report_date) `{compared_report_date}` 기준으로 "
+                    f"**{compared_left_name}**(기관 A)와 "
+                    f"**{compared_right_name}**(기관 B)를 비교했습니다."
+                )
+
+                # --- A. 요약 지표 -----------------------------------------
+                st.markdown("**요약 지표**")
+                institution_count_columns = st.columns(3)
+                institution_count_columns[0].metric(
+                    "공통 보유", f"{institution_summary.get('common_count', 0)}개"
+                )
+                institution_count_columns[1].metric(
+                    f"{short_left} 단독",
+                    f"{institution_summary.get('left_only_count', 0)}개",
+                )
+                institution_count_columns[2].metric(
+                    f"{short_right} 단독",
+                    f"{institution_summary.get('right_only_count', 0)}개",
+                )
+
+                institution_overlap_columns = st.columns(2)
+                institution_overlap_columns[0].metric(
+                    "종목 중복률",
+                    format_overlap_percent(
+                        institution_summary.get("security_overlap_pct")
+                    ),
+                    help="두 기관 포지션을 합친 개수 중 공통 보유가 차지하는 비율(%)",
+                )
+                institution_overlap_columns[1].metric(
+                    "비중 기준 중복도",
+                    format_overlap_percent(
+                        institution_summary.get("weighted_overlap_pct")
+                    ),
+                    help=(
+                        "공통 보유 종목마다 두 기관의 비중 중 작은 값을 더한 값(%). "
+                        "포트폴리오의 몇 %가 겹치는지를 나타냅니다."
+                    ),
+                )
+                st.caption(
+                    "종목 중복률은 '몇 종목을 함께 들고 있는지', 비중 기준 중복도는 "
+                    "'포트폴리오의 몇 %가 겹치는지'를 나타냅니다. 두 값은 서로 다른 "
+                    "관점이므로 함께 확인해 주세요."
+                )
+
+                # --- B. 비교 결과 표 --------------------------------------
+                st.markdown("**보유 종목 비교 상세**")
+                st.caption(
+                    "짝을 맞추는 기준은 CUSIP + 옵션 구분 + 수량 단위입니다. "
+                    "같은 회사라도 일반 주식 보유와 Put/Call 옵션 보유는 서로 다른 "
+                    "줄로 비교합니다. 한쪽만 보유한 종목의 반대쪽 값은 0으로 표시합니다. "
+                    "평가금액은 SEC Information Table의 reported value 필드를 환산 없이 "
+                    "그대로 표시하므로, 기관 간 비교는 비중(%)을 기준으로 봐 주세요."
+                )
+
+                institution_type_labels = {
+                    HOLDING_TYPE_COMMON: "공통 보유",
+                    HOLDING_TYPE_LEFT_ONLY: f"{short_left} 단독",
+                    HOLDING_TYPE_RIGHT_ONLY: f"{short_right} 단독",
+                }
+                institution_type_rows = {
+                    holding_type: institution_rows_by_type(
+                        institution_comparison, holding_type
+                    )
+                    for holding_type in INSTITUTION_HOLDING_TYPE_ORDER
+                }
+
+                institution_tabs = st.tabs(
+                    [
+                        f"{institution_type_labels[holding_type]} "
+                        f"({len(institution_type_rows[holding_type])})"
+                        for holding_type in INSTITUTION_HOLDING_TYPE_ORDER
+                    ]
+                )
+
+                for tab, holding_type in zip(
+                    institution_tabs, INSTITUTION_HOLDING_TYPE_ORDER
+                ):
+                    with tab:
+                        render_institution_holdings_table(
+                            institution_type_rows[holding_type]
+                        )
+
+                # --- C. 해석 시 주의 --------------------------------------
+                st.warning(
+                    "13F는 **분기 말(기준일) 기준 보유 현황**이며 실시간 포트폴리오가 "
+                    "아닙니다. 공시 이후의 매매는 반영되어 있지 않습니다."
+                )
+                st.caption(
+                    "비교 결과는 13F 공시 대상 증권(주로 미국 상장 주식과 일부 옵션 등) "
+                    "범위에 한정됩니다. 채권·현물·해외 주식·공매도 포지션 등 13F에 "
+                    "보고되지 않는 자산은 포함되지 않습니다."
+                )
+                st.caption(
+                    "공통 보유는 같은 시점에 같은 종목을 보고했다는 사실만 알려 주며, "
+                    "두 기관이 동일한 투자 의도나 전략을 가졌다는 뜻은 아닙니다. "
+                    "보유 이유·기간·연계 포지션은 공시 데이터로 알 수 없습니다."
+                )
 
 st.divider()
 

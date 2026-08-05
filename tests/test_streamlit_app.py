@@ -8,23 +8,44 @@ Streamlit 위젯은 `streamlit run` 없이 불러오면 기본값을 돌려주�
 SEC에 실제로 접속하지 않습니다. 조회 함수는 모두 가짜(mock)로 바꿔치기합니다.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
 import streamlit_app
+from services.institution_comparison import (
+    HOLDING_TYPE_COMMON,
+    HOLDING_TYPE_LEFT_ONLY,
+    HOLDING_TYPE_RIGHT_ONLY,
+    compare_institution_portfolios,
+    find_common_report_dates,
+    index_filings_by_report_date,
+    summarize_institution_comparison,
+)
 from streamlit_app import (
     ANALYSIS_STATE_KEYS,
     DEFAULT_MANAGER,
+    INSTITUTION_COMPARISON_STATE_KEYS,
+    INSTITUTION_DISPLAY_COLUMNS,
     cached_13f_holdings,
     cached_recent_filings,
+    can_compare_institutions,
     clear_sec_caches,
     default_manager_index,
     find_manager,
+    format_overlap_percent,
+    institution_column_config,
+    institution_default_index,
+    institution_filing_for_date,
+    institution_rows_by_type,
     load_managers,
     manager_options,
+    render_institution_holdings_table,
     reset_analysis_state,
+    reset_institution_comparison_state,
+    short_institution_name,
+    sync_institution_pair,
     sync_selected_manager,
     table_height,
 )
@@ -553,3 +574,599 @@ def test_cache_reset_does_not_touch_analysis_state():
     assert state["active_manager_name"] == "Berkshire Hathaway"
     for key in EXPECTED_RESET_KEYS:
         assert state[key] is not None
+
+
+# ---------------------------------------------------------------------------
+# 기관 간 동일 분기 비교 화면
+#
+# SEC에 접속하지 않습니다. 공시 목록과 보유 종목은 아래 예시 값을 씁니다.
+# ---------------------------------------------------------------------------
+
+# 기관 A(왼쪽)의 최근 공시 예시. 최신순으로 내려온다고 가정합니다.
+LEFT_FILINGS = [
+    {
+        "accession_number": "0000950123-25-000001",
+        "filing_date": "2025-05-15",
+        "report_date": "2025-03-31",
+        "primary_document": "primary_doc.xml",
+    },
+    {
+        "accession_number": "0000950123-25-000002",
+        "filing_date": "2025-02-14",
+        "report_date": "2024-12-31",
+        "primary_document": "primary_doc.xml",
+    },
+]
+
+# 기관 B(오른쪽)의 최근 공시 예시. 제출일은 다르지만 기준일 하나가 겹칩니다.
+RIGHT_FILINGS = [
+    {
+        "accession_number": "0000950123-25-000101",
+        "filing_date": "2025-05-12",
+        "report_date": "2025-03-31",
+        "primary_document": "primary_doc.xml",
+    },
+    {
+        "accession_number": "0000950123-24-000102",
+        "filing_date": "2024-08-14",
+        "report_date": "2024-06-30",
+        "primary_document": "primary_doc.xml",
+    },
+]
+
+LEFT_HOLDINGS = [
+    {
+        "issuer_name": "APPLE INC",
+        "class_title": "COM",
+        "cusip": "037833100",
+        "reported_value": 60000,
+        "shares": 600,
+        "share_type": "SH",
+        "put_call": "",
+    },
+    {
+        "issuer_name": "COCA COLA CO",
+        "class_title": "COM",
+        "cusip": "191216100",
+        "reported_value": 40000,
+        "shares": 400,
+        "share_type": "SH",
+        "put_call": "",
+    },
+]
+
+RIGHT_HOLDINGS = [
+    {
+        "issuer_name": "APPLE INC",
+        "class_title": "COM",
+        "cusip": "037833100",
+        "reported_value": 30000,
+        "shares": 300,
+        "share_type": "SH",
+        "put_call": "",
+    },
+    {
+        "issuer_name": "CHIPOTLE MEXICAN GRILL INC",
+        "class_title": "COM",
+        "cusip": "169656105",
+        "reported_value": 70000,
+        "shares": 100,
+        "share_type": "SH",
+        "put_call": "",
+    },
+]
+
+# 기관 비교 화면이 만들어 두는 상태 키(초기화 대상).
+EXPECTED_INSTITUTION_RESET_KEYS = [
+    "institution_common_dates",
+    "institution_left_filings_by_date",
+    "institution_right_filings_by_date",
+    "institution_selected_report_date",
+    "institution_comparison",
+    "institution_comparison_summary",
+    "institution_comparison_filings",
+    "institution_comparison_error",
+    "institution_comparison_warning",
+    "institution_comparison_left_name",
+    "institution_comparison_right_name",
+]
+
+
+def sample_institution_comparison() -> pd.DataFrame:
+    """예시 보유 종목으로 만든 두 기관 비교 결과."""
+    return compare_institution_portfolios(LEFT_HOLDINGS, RIGHT_HOLDINGS)
+
+
+def filled_institution_state() -> dict:
+    """단일 기관 분석과 기관 비교를 모두 한 번씩 마친 뒤의 화면 상태 예시."""
+    state = filled_state()
+    for key in EXPECTED_INSTITUTION_RESET_KEYS:
+        state[key] = f"{key}-이전 비교 결과"
+    state["active_institution_pair"] = (
+        "Berkshire Hathaway",
+        "Pershing Square Capital Management",
+    )
+    return state
+
+
+# --- 조회 범위 설정 --------------------------------------------------------
+
+
+def test_institution_comparison_filing_limit_is_eight():
+    """기관 비교 화면은 최근 8건 범위에서 공통 분기를 찾아야 한다."""
+    assert streamlit_app.INSTITUTION_COMPARISON_FILING_LIMIT == 8
+
+
+def test_single_manager_filing_limit_is_not_affected():
+    """단일 기관 분석의 조회 건수는 그대로 2건이어야 한다."""
+    assert streamlit_app.FILING_LIMIT == 2
+    assert (
+        streamlit_app.INSTITUTION_COMPARISON_FILING_LIMIT != streamlit_app.FILING_LIMIT
+    )
+
+
+def test_institution_default_pair_is_berkshire_and_pershing():
+    """기본 비교 대상은 Berkshire(기관 A)와 Pershing Square(기관 B)여야 한다."""
+    assert streamlit_app.DEFAULT_LEFT_INSTITUTION == "Berkshire Hathaway"
+    assert (
+        streamlit_app.DEFAULT_RIGHT_INSTITUTION
+        == "Pershing Square Capital Management"
+    )
+
+
+def test_institution_default_index_points_to_each_default(managers):
+    """두 선택 상자의 기본값이 각각 지정한 기관을 가리켜야 한다."""
+    names = manager_options(managers)
+
+    left_index = institution_default_index(
+        names, streamlit_app.DEFAULT_LEFT_INSTITUTION
+    )
+    right_index = institution_default_index(
+        names,
+        streamlit_app.DEFAULT_RIGHT_INSTITUTION,
+        avoid=streamlit_app.DEFAULT_LEFT_INSTITUTION,
+    )
+
+    assert names[left_index] == "Berkshire Hathaway"
+    assert names[right_index] == "Pershing Square Capital Management"
+    # 처음 화면을 열었을 때 두 상자가 같은 기관을 가리키지 않아야 합니다.
+    assert left_index != right_index
+
+
+def test_institution_default_index_avoids_the_other_default():
+    """기본 기관이 목록에 없으면 반대쪽 기본 기관과 다른 기관을 골라야 한다."""
+    names = ["Berkshire Hathaway", "Bridgewater Associates"]
+
+    index = institution_default_index(
+        names, "Pershing Square Capital Management", avoid="Berkshire Hathaway"
+    )
+
+    assert names[index] == "Bridgewater Associates"
+
+
+# --- 기관 비교 전용 상태 초기화 --------------------------------------------
+
+
+def test_institution_state_keys_cover_every_required_key():
+    """초기화 대상 목록에 기관 비교 상태 키가 모두 들어 있어야 한다."""
+    assert set(INSTITUTION_COMPARISON_STATE_KEYS) == set(
+        EXPECTED_INSTITUTION_RESET_KEYS
+    )
+
+
+def test_institution_state_keys_do_not_overlap_analysis_keys():
+    """단일 기관 분석 상태 키와 이름이 겹치지 않아야 한다."""
+    assert not set(INSTITUTION_COMPARISON_STATE_KEYS) & set(ANALYSIS_STATE_KEYS)
+
+
+def test_reset_institution_comparison_state_clears_only_institution_keys():
+    """기관 비교 초기화는 지정된 기관 비교 키만 비워야 한다."""
+    state = filled_institution_state()
+
+    reset_institution_comparison_state(state)
+
+    for key in EXPECTED_INSTITUTION_RESET_KEYS:
+        assert state[key] is None
+
+
+def test_reset_institution_comparison_state_keeps_single_manager_results():
+    """기관 비교 초기화가 단일 기관 분석 결과를 지우지 않아야 한다."""
+    state = filled_institution_state()
+
+    reset_institution_comparison_state(state)
+
+    for key in EXPECTED_RESET_KEYS:
+        assert state[key] is not None
+    assert state["active_manager_name"] == "Berkshire Hathaway"
+    assert state["selected_filing_index"] == 1
+
+
+def test_reset_analysis_state_keeps_institution_comparison_results():
+    """반대로 단일 기관 초기화도 기관 비교 결과를 건드리지 않아야 한다."""
+    state = filled_institution_state()
+
+    reset_analysis_state(state)
+
+    for key in EXPECTED_INSTITUTION_RESET_KEYS:
+        assert state[key] is not None
+
+
+def test_changing_single_manager_keeps_institution_comparison_results():
+    """위쪽 기관을 바꿔도 기관 비교 결과는 남아 있어야 한다."""
+    state = filled_institution_state()
+
+    sync_selected_manager(state, "Bridgewater Associates")
+
+    for key in EXPECTED_INSTITUTION_RESET_KEYS:
+        assert state[key] is not None
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        ("Bridgewater Associates", "Pershing Square Capital Management"),  # A 변경
+        ("Berkshire Hathaway", "Bridgewater Associates"),  # B 변경
+    ],
+)
+def test_changing_institution_pair_resets_only_comparison_results(pair):
+    """기관 A 또는 B가 바뀌면 비교 결과만 지워야 한다."""
+    state = filled_institution_state()
+
+    changed = sync_institution_pair(state, *pair)
+
+    assert changed is True
+    for key in EXPECTED_INSTITUTION_RESET_KEYS:
+        assert state[key] is None
+    # 단일 기관 분석 결과는 그대로 남습니다.
+    for key in EXPECTED_RESET_KEYS:
+        assert state[key] is not None
+    assert state["active_institution_pair"] == pair
+
+
+def test_rerun_with_same_institution_pair_keeps_results():
+    """같은 기관 조합에서 화면이 다시 실행될 때는 결과가 사라지지 않아야 한다."""
+    state = filled_institution_state()
+    before = dict(state)
+
+    changed = sync_institution_pair(
+        state, "Berkshire Hathaway", "Pershing Square Capital Management"
+    )
+
+    assert changed is False
+    assert state == before
+
+
+def test_swapping_institution_sides_resets_results():
+    """A와 B를 서로 바꾼 것도 다른 조합이므로 결과를 지워야 한다."""
+    state = filled_institution_state()
+
+    changed = sync_institution_pair(
+        state, "Pershing Square Capital Management", "Berkshire Hathaway"
+    )
+
+    assert changed is True
+    assert state["institution_comparison"] is None
+
+
+# --- 같은 기관 선택 --------------------------------------------------------
+
+
+def test_same_institution_cannot_be_compared():
+    """기관 A와 기관 B가 같으면 비교를 진행하지 않아야 한다."""
+    assert can_compare_institutions("Berkshire Hathaway", "Berkshire Hathaway") is False
+
+
+def test_different_institutions_can_be_compared():
+    """서로 다른 두 기관은 비교할 수 있어야 한다."""
+    assert (
+        can_compare_institutions(
+            "Berkshire Hathaway", "Pershing Square Capital Management"
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("", "Berkshire Hathaway"),
+        ("Berkshire Hathaway", ""),
+        (None, None),
+        ("Berkshire Hathaway", " Berkshire Hathaway "),  # 공백만 다른 같은 이름
+    ],
+)
+def test_incomplete_institution_selection_cannot_be_compared(left, right):
+    """기관을 고르지 않았거나 공백만 다른 같은 이름이면 비교하지 않아야 한다."""
+    assert can_compare_institutions(left, right) is False
+
+
+# --- 공통 report_date 찾기 -------------------------------------------------
+
+
+def test_common_report_dates_are_newest_first():
+    """공통 기준일은 최신순으로 나와야 한다(제출일이 아니라 기준일 기준)."""
+    both_quarters = LEFT_FILINGS + [
+        {
+            "accession_number": "0000950123-24-000103",
+            "filing_date": "2025-02-10",
+            "report_date": "2024-12-31",
+            "primary_document": "primary_doc.xml",
+        }
+    ]
+
+    common = find_common_report_dates(LEFT_FILINGS, both_quarters)
+
+    assert common == ["2025-03-31", "2024-12-31"]
+
+
+def test_common_report_dates_use_report_date_not_filing_date():
+    """제출일이 달라도 기준일이 같으면 공통 분기로 잡아야 한다."""
+    common = find_common_report_dates(LEFT_FILINGS, RIGHT_FILINGS)
+
+    assert common == ["2025-03-31"]
+
+
+def test_no_common_report_date_is_handled_safely():
+    """겹치는 분기가 없으면 빈 목록을 돌려주어 화면이 비교를 막을 수 있어야 한다."""
+    other_filings = [
+        {
+            "accession_number": "0000950123-23-000900",
+            "filing_date": "2023-08-14",
+            "report_date": "2023-06-30",
+            "primary_document": "primary_doc.xml",
+        }
+    ]
+
+    common = find_common_report_dates(LEFT_FILINGS, other_filings)
+
+    assert common == []
+
+
+def test_institution_filing_for_date_picks_matching_filing():
+    """선택한 기준일의 공시(접수번호·제출일)를 기관별로 찾아야 한다."""
+    left_by_date = index_filings_by_report_date(LEFT_FILINGS)
+    right_by_date = index_filings_by_report_date(RIGHT_FILINGS)
+
+    left_filing = institution_filing_for_date(left_by_date, "2025-03-31")
+    right_filing = institution_filing_for_date(right_by_date, "2025-03-31")
+
+    assert left_filing["accession_number"] == "0000950123-25-000001"
+    assert left_filing["filing_date"] == "2025-05-15"
+    assert right_filing["accession_number"] == "0000950123-25-000101"
+    assert right_filing["filing_date"] == "2025-05-12"
+
+
+@pytest.mark.parametrize(
+    ("filings_by_date", "report_date"),
+    [
+        ({}, "2025-03-31"),  # 아직 조회하지 않은 상태
+        (None, "2025-03-31"),  # 상태가 비어 있는 경우
+        (index_filings_by_report_date(LEFT_FILINGS), "2019-12-31"),  # 없는 분기
+        (index_filings_by_report_date(LEFT_FILINGS), None),  # 기준일 미선택
+    ],
+)
+def test_institution_filing_for_date_returns_empty_when_missing(
+    filings_by_date, report_date
+):
+    """찾지 못하면 빈 딕셔너리를 돌려주어 화면이 멈추지 않아야 한다."""
+    assert institution_filing_for_date(filings_by_date, report_date) == {}
+
+
+# --- 요약 지표 표시 형식 ---------------------------------------------------
+
+
+def test_format_overlap_percent_uses_one_decimal():
+    """중복률·중복도는 소수점 한 자리로 표시하고 부호를 붙이지 않는다."""
+    assert format_overlap_percent(12.1948) == "12.2%"
+    assert format_overlap_percent(18.5) == "18.5%"
+    assert format_overlap_percent(0) == "0.0%"
+    assert format_overlap_percent(100) == "100.0%"
+
+
+def test_format_overlap_percent_handles_missing_value():
+    """계산할 수 없는 값은 안내 문구로 바꾼다."""
+    assert format_overlap_percent(None) == "계산 불가"
+    assert format_overlap_percent(float("nan")) == "계산 불가"
+
+
+def test_summary_metrics_are_formatted_for_display():
+    """요약 지표가 화면 표시용 문자열로 정상 변환되어야 한다."""
+    summary = summarize_institution_comparison(sample_institution_comparison())
+
+    # 예시 데이터: 공통 1종목(APPLE), 기관 A 단독 1종목, 기관 B 단독 1종목.
+    assert f"{summary['common_count']}개" == "1개"
+    assert f"{summary['left_only_count']}개" == "1개"
+    assert f"{summary['right_only_count']}개" == "1개"
+    # 종목 중복률 = 1 / 3 * 100 = 33.3%
+    assert format_overlap_percent(summary["security_overlap_pct"]) == "33.3%"
+    # 비중 기준 중복도 = min(60%, 30%) = 30.0%
+    assert format_overlap_percent(summary["weighted_overlap_pct"]) == "30.0%"
+
+
+def test_empty_comparison_summary_is_formatted_safely():
+    """비교 결과가 없어도 지표 표시가 오류 없이 0으로 나와야 한다."""
+    summary = summarize_institution_comparison(compare_institution_portfolios([], []))
+
+    assert f"{summary['common_count']}개" == "0개"
+    assert format_overlap_percent(summary["security_overlap_pct"]) == "0.0%"
+    assert format_overlap_percent(summary["weighted_overlap_pct"]) == "0.0%"
+
+
+def test_short_institution_name_keeps_leading_words():
+    """지표·탭 제목에 쓰는 짧은 이름은 앞쪽 단어만 남긴다."""
+    assert short_institution_name("Berkshire Hathaway") == "Berkshire"
+    assert (
+        short_institution_name("Pershing Square Capital Management")
+        == "Pershing Square"
+    )
+    # 짧은 이름은 그대로 씁니다.
+    assert short_institution_name("Bridgewater") == "Bridgewater"
+
+
+def test_short_institution_name_handles_empty_value():
+    """이름이 비어 있어도 오류 없이 빈 문자열을 돌려준다."""
+    assert short_institution_name(None) == ""
+    assert short_institution_name("  ") == ""
+
+
+# --- 비교 결과 표 ----------------------------------------------------------
+
+
+def test_institution_display_columns_include_required_columns():
+    """비교 결과 표에 필요한 열이 모두 들어 있어야 한다."""
+    required = [
+        "issuer_name",
+        "cusip",
+        "put_call",
+        "share_type",
+        "left_reported_value",
+        "right_reported_value",
+        "left_weight_pct",
+        "right_weight_pct",
+        "weight_gap_pct_point",
+    ]
+
+    for column in required:
+        assert column in INSTITUTION_DISPLAY_COLUMNS
+
+    # 내부 식별용 키는 화면에 내보내지 않습니다.
+    assert "position_key" not in INSTITUTION_DISPLAY_COLUMNS
+
+
+def test_institution_display_columns_exist_in_comparison_result():
+    """표시할 열이 계산 결과에 실제로 있어야 한다."""
+    comparison = sample_institution_comparison()
+
+    for column in INSTITUTION_DISPLAY_COLUMNS:
+        assert column in comparison.columns
+
+
+def test_institution_column_labels_are_korean():
+    """표의 열 제목이 한국어 표시명으로 설정되어야 한다."""
+    expected_labels = {
+        "issuer_name": "종목명",
+        "cusip": "CUSIP",
+        "put_call": "옵션 구분",
+        "share_type": "수량 단위",
+        "left_reported_value": "기관 A 공시 평가금액",
+        "right_reported_value": "기관 B 공시 평가금액",
+        "left_weight_pct": "기관 A 비중",
+        "right_weight_pct": "기관 B 비중",
+        "weight_gap_pct_point": "비중 차이(%p)",
+    }
+
+    config = institution_column_config()
+
+    for column, label in expected_labels.items():
+        assert config[column]["label"] == label
+
+
+def test_institution_rows_by_type_splits_three_groups():
+    """공통 보유 / 기관 A 단독 / 기관 B 단독으로 나뉘어야 한다."""
+    comparison = sample_institution_comparison()
+
+    common = institution_rows_by_type(comparison, HOLDING_TYPE_COMMON)
+    left_only = institution_rows_by_type(comparison, HOLDING_TYPE_LEFT_ONLY)
+    right_only = institution_rows_by_type(comparison, HOLDING_TYPE_RIGHT_ONLY)
+
+    assert common["issuer_name"].tolist() == ["APPLE INC"]
+    assert left_only["issuer_name"].tolist() == ["COCA COLA CO"]
+    assert right_only["issuer_name"].tolist() == ["CHIPOTLE MEXICAN GRILL INC"]
+
+
+def test_institution_rows_by_type_handles_empty_comparison():
+    """비교 결과가 비어 있어도 오류 없이 빈 표를 돌려주어야 한다."""
+    empty = compare_institution_portfolios([], [])
+
+    for holding_type in (
+        HOLDING_TYPE_COMMON,
+        HOLDING_TYPE_LEFT_ONLY,
+        HOLDING_TYPE_RIGHT_ONLY,
+    ):
+        rows = institution_rows_by_type(empty, holding_type)
+        assert len(rows) == 0
+
+
+def test_institution_rows_by_type_handles_missing_column():
+    """유형 열이 없는 표를 받아도 빈 표를 돌려주어야 한다."""
+    rows = institution_rows_by_type(pd.DataFrame({"issuer_name": ["A"]}), "공통 보유")
+
+    assert len(rows) == 0
+
+
+# --- dataframe 높이 --------------------------------------------------------
+
+
+def test_empty_comparison_table_is_not_rendered():
+    """비어 있는 비교 결과에서는 st.dataframe을 호출하지 않아야 한다.
+
+    빈 표에 height를 넘겨 StreamlitInvalidHeightError가 나던 문제를 막기 위해,
+    행이 없으면 표 대신 안내 문구만 보여 줍니다.
+    """
+    empty = institution_rows_by_type(
+        compare_institution_portfolios([], []), HOLDING_TYPE_COMMON
+    )
+
+    with patch.object(streamlit_app, "st", MagicMock()) as fake_st:
+        render_institution_holdings_table(empty)
+
+    fake_st.dataframe.assert_not_called()
+    fake_st.info.assert_called_once_with("해당 종목이 없습니다.")
+
+
+@pytest.mark.parametrize("rows", [None, pd.DataFrame()])
+def test_missing_comparison_table_is_not_rendered(rows):
+    """비교 결과가 아예 없을 때도 표를 그리지 않아야 한다."""
+    with patch.object(streamlit_app, "st", MagicMock()) as fake_st:
+        render_institution_holdings_table(rows)
+
+    fake_st.dataframe.assert_not_called()
+
+
+def test_comparison_table_height_is_valid_streamlit_value():
+    """표를 그릴 때는 height에 항상 유효한 값(None 아님)을 넘겨야 한다."""
+    rows = institution_rows_by_type(sample_institution_comparison(), HOLDING_TYPE_COMMON)
+
+    with patch.object(streamlit_app, "st", MagicMock()) as fake_st:
+        render_institution_holdings_table(rows)
+
+    fake_st.dataframe.assert_called_once()
+    _assert_valid_streamlit_height(fake_st.dataframe.call_args.kwargs["height"])
+
+
+def test_comparison_table_height_is_valid_for_many_rows():
+    """행이 많은 비교 결과도 유효한 높이(픽셀)를 써서 표 안에서 스크롤되게 한다."""
+    many_left = [
+        {
+            "issuer_name": f"COMPANY {index:03d}",
+            "class_title": "COM",
+            "cusip": f"{index:09d}",
+            "reported_value": 1000 + index,
+            "shares": 100,
+            "share_type": "SH",
+            "put_call": "",
+        }
+        for index in range(40)
+    ]
+    rows = institution_rows_by_type(
+        compare_institution_portfolios(many_left, many_left), HOLDING_TYPE_COMMON
+    )
+    assert len(rows) == 40
+
+    with patch.object(streamlit_app, "st", MagicMock()) as fake_st:
+        render_institution_holdings_table(rows)
+
+    height = fake_st.dataframe.call_args.kwargs["height"]
+    _assert_valid_streamlit_height(height)
+    assert height == streamlit_app.LARGE_TABLE_HEIGHT
+
+
+def test_comparison_table_shows_only_display_columns():
+    """표에는 정해진 열만 정해진 순서로 넘겨야 한다."""
+    rows = institution_rows_by_type(sample_institution_comparison(), HOLDING_TYPE_COMMON)
+
+    with patch.object(streamlit_app, "st", MagicMock()) as fake_st:
+        render_institution_holdings_table(rows)
+
+    rendered = fake_st.dataframe.call_args.args[0]
+    assert list(rendered.columns) == INSTITUTION_DISPLAY_COLUMNS
