@@ -23,3 +23,4 @@ $ curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
    $ uv run streamlit run streamlit_app.py
    ```
+
