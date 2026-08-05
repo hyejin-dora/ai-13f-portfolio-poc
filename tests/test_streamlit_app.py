@@ -23,9 +23,11 @@ from services.institution_comparison import (
     index_filings_by_report_date,
     summarize_institution_comparison,
 )
+from services.llm_client import LlmApiError
 from streamlit_app import (
     ANALYSIS_STATE_KEYS,
     DEFAULT_MANAGER,
+    INSTITUTION_AI_BRIEFING_STATE_KEYS,
     INSTITUTION_COMPARISON_STATE_KEYS,
     INSTITUTION_DISPLAY_COLUMNS,
     cached_13f_holdings,
@@ -35,6 +37,7 @@ from streamlit_app import (
     default_manager_index,
     find_manager,
     format_overlap_percent,
+    institution_briefing_payload_from_state,
     institution_column_config,
     institution_default_index,
     institution_filing_for_date,
@@ -43,8 +46,11 @@ from streamlit_app import (
     manager_options,
     render_institution_holdings_table,
     reset_analysis_state,
+    reset_institution_ai_briefing_state,
     reset_institution_comparison_state,
+    run_institution_ai_briefing,
     short_institution_name,
+    sync_institution_briefing_report_date,
     sync_institution_pair,
     sync_selected_manager,
     table_height,
@@ -669,6 +675,14 @@ EXPECTED_INSTITUTION_RESET_KEYS = [
     "institution_comparison_warning",
     "institution_comparison_left_name",
     "institution_comparison_right_name",
+    "institution_ai_briefing",
+    "institution_ai_briefing_error",
+]
+
+# 그중 기관 비교 AI 브리핑만 담는 키.
+EXPECTED_INSTITUTION_BRIEFING_KEYS = [
+    "institution_ai_briefing",
+    "institution_ai_briefing_error",
 ]
 
 
@@ -1170,3 +1184,315 @@ def test_comparison_table_shows_only_display_columns():
 
     rendered = fake_st.dataframe.call_args.args[0]
     assert list(rendered.columns) == INSTITUTION_DISPLAY_COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# 기관 비교 AI 브리핑
+#
+# 실제 Gemini API에는 요청을 보내지 않습니다. 설정 읽기와 생성 함수를 모두
+# 가짜(mock)로 바꿔치기하고, 화면 상태에 무엇이 담기는지만 확인합니다.
+# ---------------------------------------------------------------------------
+
+FAKE_GEMINI_API_KEY = "AIza-TEST-FAKE-KEY-1234567890"
+FAKE_GEMINI_MODEL = "gemini-test-model"
+FAKE_BRIEFING_TEXT = "## 1. 한눈에 보는 비교\n예시 브리핑 본문입니다."
+
+COMPARED_LEFT_NAME = "Berkshire Hathaway"
+COMPARED_RIGHT_NAME = "Pershing Square Capital Management"
+COMPARED_REPORT_DATE = "2025-03-31"
+
+
+def compared_state() -> dict:
+    """기관 비교를 한 번 마친 뒤의 화면 상태 예시.
+
+    단일 기관 브리핑 결과도 함께 담아 두어, 기관 비교 쪽 동작이 단일 기관
+    상태를 건드리지 않는지 확인할 수 있게 합니다.
+    """
+    comparison = sample_institution_comparison()
+
+    return {
+        "institution_comparison": comparison,
+        "institution_comparison_summary": summarize_institution_comparison(comparison),
+        "institution_selected_report_date": COMPARED_REPORT_DATE,
+        "institution_comparison_left_name": COMPARED_LEFT_NAME,
+        "institution_comparison_right_name": COMPARED_RIGHT_NAME,
+        "institution_ai_briefing": None,
+        "institution_ai_briefing_error": None,
+        "ai_briefing": "단일 기관 브리핑 본문",
+        "ai_briefing_error": None,
+    }
+
+
+def patch_briefing(briefing_text=FAKE_BRIEFING_TEXT, error=None, settings_error=None):
+    """AI 브리핑 실행에 필요한 외부 의존을 모두 가짜로 바꿉니다.
+
+    Returns:
+        (patcher 목록을 적용하는 컨텍스트 매니저 목록, 가짜 generate_briefing)
+    """
+    fake_generate = MagicMock()
+    if error is not None:
+        fake_generate.side_effect = error
+    else:
+        fake_generate.return_value = briefing_text
+
+    fake_settings = MagicMock()
+    if settings_error is not None:
+        fake_settings.side_effect = settings_error
+    else:
+        fake_settings.return_value = (FAKE_GEMINI_API_KEY, FAKE_GEMINI_MODEL)
+
+    return (
+        [
+            patch.object(streamlit_app, "st", MagicMock()),
+            patch.object(streamlit_app, "read_gemini_settings", fake_settings),
+            patch.object(streamlit_app, "generate_briefing", fake_generate),
+        ],
+        fake_generate,
+    )
+
+
+def run_briefing(state, **kwargs):
+    """가짜 Gemini로 기관 비교 AI 브리핑을 실행하고 호출 기록을 돌려줍니다."""
+    patchers, fake_generate = patch_briefing(**kwargs)
+
+    for patcher in patchers:
+        patcher.start()
+    try:
+        run_institution_ai_briefing(state)
+    finally:
+        for patcher in reversed(patchers):
+            patcher.stop()
+
+    return fake_generate
+
+
+# --- 상태 키 분리 ----------------------------------------------------------
+
+
+def test_institution_briefing_state_keys_are_separate_from_single_manager():
+    """기관 비교 AI 브리핑 상태 키는 단일 기관 브리핑 키와 겹치지 않아야 한다."""
+    assert set(INSTITUTION_AI_BRIEFING_STATE_KEYS) == set(
+        EXPECTED_INSTITUTION_BRIEFING_KEYS
+    )
+    assert not set(INSTITUTION_AI_BRIEFING_STATE_KEYS) & set(ANALYSIS_STATE_KEYS)
+    assert "ai_briefing" not in INSTITUTION_AI_BRIEFING_STATE_KEYS
+    assert "ai_briefing_error" not in INSTITUTION_AI_BRIEFING_STATE_KEYS
+
+
+def test_institution_briefing_keys_are_part_of_comparison_state():
+    """기관 비교 상태를 지우면 AI 브리핑도 함께 지워지도록 목록에 들어 있어야 한다."""
+    for key in INSTITUTION_AI_BRIEFING_STATE_KEYS:
+        assert key in INSTITUTION_COMPARISON_STATE_KEYS
+
+
+def test_reset_institution_comparison_state_clears_ai_briefing():
+    """기관 비교 초기화는 기관 비교 AI 브리핑 결과도 지워야 한다."""
+    state = filled_institution_state()
+
+    reset_institution_comparison_state(state)
+
+    for key in EXPECTED_INSTITUTION_BRIEFING_KEYS:
+        assert state[key] is None
+
+
+def test_changing_institution_pair_clears_ai_briefing():
+    """비교할 기관을 바꾸면 앞서 만든 AI 브리핑이 남아 있지 않아야 한다."""
+    state = filled_institution_state()
+
+    changed = sync_institution_pair(state, "Bridgewater Associates", COMPARED_RIGHT_NAME)
+
+    assert changed is True
+    for key in EXPECTED_INSTITUTION_BRIEFING_KEYS:
+        assert state[key] is None
+
+
+def test_reset_institution_ai_briefing_keeps_comparison_result():
+    """AI 브리핑만 지울 때는 비교 표와 요약 지표를 그대로 두어야 한다."""
+    state = filled_institution_state()
+
+    reset_institution_ai_briefing_state(state)
+
+    for key in EXPECTED_INSTITUTION_BRIEFING_KEYS:
+        assert state[key] is None
+    assert state["institution_comparison"] is not None
+    assert state["institution_comparison_summary"] is not None
+
+
+def test_reset_institution_ai_briefing_keeps_single_manager_briefing():
+    """기관 비교 브리핑을 지워도 단일 기관 브리핑은 남아 있어야 한다."""
+    state = filled_institution_state()
+
+    reset_institution_ai_briefing_state(state)
+
+    assert state["ai_briefing"] is not None
+    assert state["ai_briefing_error"] is not None
+
+
+def test_changing_report_date_clears_institution_ai_briefing():
+    """비교 기준일을 바꾸면 기관 비교 AI 브리핑을 지워야 한다."""
+    state = filled_institution_state()
+    state["active_institution_briefing_date"] = "2025-03-31"
+
+    changed = sync_institution_briefing_report_date(state, "2024-12-31")
+
+    assert changed is True
+    for key in EXPECTED_INSTITUTION_BRIEFING_KEYS:
+        assert state[key] is None
+    # 비교 결과와 단일 기관 브리핑은 그대로 남아야 합니다.
+    assert state["institution_comparison"] is not None
+    assert state["ai_briefing"] is not None
+
+
+def test_same_report_date_keeps_institution_ai_briefing():
+    """같은 기준일에서 화면이 다시 그려질 때는 브리핑이 사라지지 않아야 한다."""
+    state = compared_state()
+    state["active_institution_briefing_date"] = COMPARED_REPORT_DATE
+    state["institution_ai_briefing"] = FAKE_BRIEFING_TEXT
+
+    changed = sync_institution_briefing_report_date(state, COMPARED_REPORT_DATE)
+
+    assert changed is False
+    assert state["institution_ai_briefing"] == FAKE_BRIEFING_TEXT
+
+
+# --- AI 입력 데이터 만들기 -------------------------------------------------
+
+
+def test_briefing_payload_uses_only_comparison_state():
+    """화면 상태의 비교 결과에서 정해진 값만 AI 입력 데이터로 옮겨야 한다."""
+    payload = institution_briefing_payload_from_state(compared_state())
+
+    assert payload["report_date"] == COMPARED_REPORT_DATE
+    assert payload["left_manager_name"] == COMPARED_LEFT_NAME
+    assert payload["right_manager_name"] == COMPARED_RIGHT_NAME
+    assert payload["summary"]["common_count"] == 1  # APPLE INC
+    assert [row["issuer_name"] for row in payload["top_common_holdings"]] == [
+        "APPLE INC"
+    ]
+
+
+def test_briefing_payload_handles_empty_state():
+    """비교 결과가 없는 상태에서도 오류 없이 입력 데이터를 만들어야 한다."""
+    payload = institution_briefing_payload_from_state({})
+
+    assert payload["report_date"] == ""
+    assert payload["left_manager_name"] == "기관 A"
+    assert payload["top_common_holdings"] == []
+
+
+# --- Gemini 호출 (mock) ----------------------------------------------------
+
+
+def test_briefing_result_is_stored_in_institution_state():
+    """생성 결과는 기관 비교 전용 상태에 담겨야 한다."""
+    state = compared_state()
+
+    fake_generate = run_briefing(state)
+
+    assert state["institution_ai_briefing"] == FAKE_BRIEFING_TEXT
+    assert state["institution_ai_briefing_error"] is None
+    fake_generate.assert_called_once()
+
+    # 프롬프트는 문자열이고, API 키와 모델명은 인자로만 넘깁니다.
+    prompt = fake_generate.call_args.args[0]
+    assert isinstance(prompt, str)
+    assert fake_generate.call_args.kwargs["api_key"] == FAKE_GEMINI_API_KEY
+    assert fake_generate.call_args.kwargs["model_name"] == FAKE_GEMINI_MODEL
+
+
+def test_briefing_prompt_contains_comparison_values_only():
+    """Gemini에 넘기는 프롬프트에 전체 비교 표나 내부 키가 없어야 한다."""
+    state = compared_state()
+
+    fake_generate = run_briefing(state)
+    prompt = fake_generate.call_args.args[0]
+
+    assert COMPARED_REPORT_DATE in prompt
+    assert COMPARED_LEFT_NAME in prompt
+    assert "position_key" not in prompt
+    assert "informationTable" not in prompt
+
+
+def test_briefing_does_not_touch_single_manager_state():
+    """기관 비교 브리핑을 만들어도 단일 기관 브리핑 상태는 그대로여야 한다."""
+    state = compared_state()
+
+    run_briefing(state)
+
+    assert state["ai_briefing"] == "단일 기관 브리핑 본문"
+
+
+def test_briefing_api_error_is_stored_in_institution_error_state():
+    """Gemini 호출 오류는 기관 비교 전용 오류 상태에 담겨야 한다."""
+    state = compared_state()
+
+    run_briefing(state, error=LlmApiError("Gemini API 사용량 한도를 넘었습니다."))
+
+    assert state["institution_ai_briefing"] is None
+    assert "사용량 한도" in state["institution_ai_briefing_error"]
+    # 단일 기관 브리핑 오류 상태에는 담기지 않아야 합니다.
+    assert state["ai_briefing_error"] is None
+
+
+def test_briefing_missing_settings_error_is_stored():
+    """GEMINI 설정이 없을 때의 안내도 기관 비교 오류 상태에 담겨야 한다."""
+    state = compared_state()
+
+    run_briefing(state, settings_error=LookupError("GEMINI_API_KEY가 없습니다."))
+
+    assert state["institution_ai_briefing"] is None
+    assert "GEMINI_API_KEY" in state["institution_ai_briefing_error"]
+
+
+def test_briefing_unexpected_error_does_not_leak_details():
+    """예상하지 못한 오류에서는 원본 내용을 화면 상태에 담지 않아야 한다."""
+    state = compared_state()
+
+    run_briefing(state, error=RuntimeError(f"unexpected {FAKE_GEMINI_API_KEY}"))
+
+    assert state["institution_ai_briefing"] is None
+    assert (
+        state["institution_ai_briefing_error"]
+        == streamlit_app.INSTITUTION_BRIEFING_UNEXPECTED_ERROR
+    )
+    assert FAKE_GEMINI_API_KEY not in state["institution_ai_briefing_error"]
+
+
+def test_briefing_error_is_cleared_on_retry():
+    """다시 생성해서 성공하면 앞선 오류 문구가 남지 않아야 한다."""
+    state = compared_state()
+    state["institution_ai_briefing_error"] = "이전 오류 문구"
+
+    run_briefing(state)
+
+    assert state["institution_ai_briefing_error"] is None
+    assert state["institution_ai_briefing"] == FAKE_BRIEFING_TEXT
+
+
+def test_briefing_calls_api_once_per_button_click():
+    """한 번 실행에 Gemini 호출은 한 번이어야 한다(화면 rerun으로 재호출 없음)."""
+    state = compared_state()
+
+    fake_generate = run_briefing(state)
+
+    assert fake_generate.call_count == 1
+
+    # 화면이 다시 그려지는 것만으로는 호출되지 않고, 상태에 담긴 글을 다시 보여줍니다.
+    assert state["institution_ai_briefing"] == FAKE_BRIEFING_TEXT
+
+
+def test_briefing_notice_mentions_no_investment_advice():
+    """화면 안내 문구에 투자 추천·투자 의도 추정을 하지 않는다는 내용이 있어야 한다."""
+    notice = streamlit_app.INSTITUTION_BRIEFING_NOTICE
+
+    assert "투자 추천" in notice
+    assert "투자 의도" in notice
+    assert "Python으로 계산된 기관 비교 결과" in notice
+
+
+def test_briefing_spinner_text_is_fixed():
+    """브리핑 생성 중 문구는 정해진 문장이어야 한다."""
+    assert (
+        streamlit_app.INSTITUTION_BRIEFING_SPINNER_TEXT
+        == "기관 비교 결과를 바탕으로 AI 브리핑을 생성하고 있습니다."
+    )

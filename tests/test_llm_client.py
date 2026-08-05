@@ -10,12 +10,18 @@ import pandas as pd
 import pytest
 from google.genai import errors as genai_errors
 
+from services.institution_comparison import (
+    build_institution_comparison_briefing_payload,
+    compare_institution_portfolios,
+    summarize_institution_comparison,
+)
 from services.llm_client import (
     TOP_CHANGE_COUNT,
     TOP_HOLDINGS_COUNT,
     EmptyResponseError,
     LlmApiError,
     build_briefing_prompt,
+    build_institution_comparison_briefing_prompt,
     generate_briefing,
 )
 from services.portfolio_analysis import compare_holdings, summarize_comparison
@@ -210,6 +216,246 @@ def test_비교_결과가_비어도_프롬프트를_만들_수_있다():
 
     assert "해당 종목 없음" in prompt
     assert "확인 불가" in prompt  # 날짜가 없을 때의 표시
+
+
+# ---------------------------------------------------------------------------
+# 기관 간 비교 프롬프트 만들기
+#
+# 프롬프트에는 institution_comparison이 계산해 둔 값만 들어가야 하고,
+# 원본 XML이나 전체 비교 표는 들어가면 안 됩니다.
+# ---------------------------------------------------------------------------
+
+# 예시 두 기관의 보유 종목.
+#   기관 A 합계 10000: APPLE 60% / COCA COLA 30% / AMEX 10%
+#   기관 B 합계  4000: APPLE 25% / COCA COLA 50% / MICROSOFT 25%
+LEFT_INSTITUTION_HOLDINGS = [
+    {
+        "issuer_name": "APPLE INC",
+        "class_title": "COM",
+        "cusip": "037833100",
+        "reported_value": 6000,
+        "shares": 600,
+        "share_type": "SH",
+        "put_call": "",
+    },
+    {
+        "issuer_name": "COCA COLA CO",
+        "class_title": "COM",
+        "cusip": "191216100",
+        "reported_value": 3000,
+        "shares": 300,
+        "share_type": "SH",
+        "put_call": "",
+    },
+    {
+        "issuer_name": "AMERICAN EXPRESS CO",
+        "class_title": "COM",
+        "cusip": "025816109",
+        "reported_value": 1000,
+        "shares": 100,
+        "share_type": "SH",
+        "put_call": "",
+    },
+]
+
+RIGHT_INSTITUTION_HOLDINGS = [
+    {
+        "issuer_name": "APPLE INC",
+        "class_title": "COM",
+        "cusip": "037833100",
+        "reported_value": 1000,
+        "shares": 100,
+        "share_type": "SH",
+        "put_call": "",
+    },
+    {
+        "issuer_name": "COCA COLA CO",
+        "class_title": "COM",
+        "cusip": "191216100",
+        "reported_value": 2000,
+        "shares": 200,
+        "share_type": "SH",
+        "put_call": "",
+    },
+    {
+        "issuer_name": "MICROSOFT CORP",
+        "class_title": "COM",
+        "cusip": "594918104",
+        "reported_value": 1000,
+        "shares": 50,
+        "share_type": "SH",
+        "put_call": "",
+    },
+]
+
+LEFT_MANAGER_NAME = "Berkshire Hathaway"
+RIGHT_MANAGER_NAME = "Pershing Square Capital Management"
+INSTITUTION_REPORT_DATE = "2025-06-30"
+
+
+@pytest.fixture
+def institution_comparison() -> pd.DataFrame:
+    """예시 두 기관의 같은 분기 비교 결과."""
+    return compare_institution_portfolios(
+        LEFT_INSTITUTION_HOLDINGS, RIGHT_INSTITUTION_HOLDINGS
+    )
+
+
+@pytest.fixture
+def institution_payload(institution_comparison) -> dict:
+    """예시 비교 결과로 만든 AI 브리핑 입력 데이터."""
+    return build_institution_comparison_briefing_payload(
+        institution_comparison,
+        summarize_institution_comparison(institution_comparison),
+        report_date=INSTITUTION_REPORT_DATE,
+        left_manager_name=LEFT_MANAGER_NAME,
+        right_manager_name=RIGHT_MANAGER_NAME,
+    )
+
+
+def test_기관_비교_프롬프트에_기관명과_기준일이_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    assert INSTITUTION_REPORT_DATE in prompt
+    assert LEFT_MANAGER_NAME in prompt
+    assert RIGHT_MANAGER_NAME in prompt
+
+
+def test_기관_비교_프롬프트에_중복률과_중복도가_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+    summary = institution_payload["summary"]
+
+    assert "종목 중복률" in prompt
+    assert "비중 기준 중복도" in prompt
+    # 공통 2종목 / 전체 4종목 = 50.00%, min(60,25) + min(30,50) = 55.00%
+    assert f"{summary['security_overlap_pct']:.2f}%" in prompt
+    assert f"{summary['weighted_overlap_pct']:.2f}%" in prompt
+
+
+def test_기관_비교_프롬프트에_종목_수_요약이_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    assert "공통 보유 종목 수: 2개" in prompt
+    assert "기관 A 단독 보유 종목 수: 1개" in prompt
+    assert "기관 B 단독 보유 종목 수: 1개" in prompt
+    assert "두 기관 보유를 합친 고유 종목 수: 4개" in prompt
+
+
+def test_기관_비교_프롬프트에_주요_종목과_비중이_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    assert "APPLE INC" in prompt  # 공통 보유
+    assert "AMERICAN EXPRESS CO" in prompt  # 기관 A 단독
+    assert "MICROSOFT CORP" in prompt  # 기관 B 단독
+    # 비중은 계산된 값 그대로 들어가고, 비중 차이는 %포인트로 표시합니다.
+    assert "기관 A 비중 60.00%" in prompt
+    assert "기관 B 비중 25.00%" in prompt
+    assert "비중 차이 +35.00%p" in prompt
+
+
+def test_기관_비교_프롬프트에_투자_의도_추정_금지가_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    # 공통 보유를 같은 전략으로 단정하지 말라는 지시.
+    assert "동일한 투자 전략" in prompt
+    # 비중 차이를 매매나 선호의 증거로 단정하지 말라는 지시.
+    assert "비중 차이를 매수·매도의 증거" in prompt
+    # 투자 이유·향후 매매·주가 전망을 추정하지 말라는 지시.
+    assert "투자 이유" in prompt
+    assert "주가 전망을 추정하지 마세요" in prompt
+
+
+def test_기관_비교_프롬프트에_투자_추천_금지가_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    assert "투자 추천이나 매수·매도 의견을 제공하지 마세요" in prompt
+
+
+def test_기관_비교_프롬프트에_공시_시차와_범위_제한이_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    # 13F는 분기 말 기준이며 실시간 포트폴리오가 아니라는 점.
+    assert "실시간 포트폴리오가 아니라는 점" in prompt
+    # 13F 대상 증권 범위에 한정된다는 점.
+    assert "13F 공시 대상 증권 범위에 한정" in prompt
+    # 공시 이후 포트폴리오가 달라졌을 수 있다는 점.
+    assert "공시 이후 실제 포트폴리오는 달라졌을 수 있다" in prompt
+    # 수치가 없으면 추정하지 말라는 점.
+    assert "추정하지 말고" in prompt
+
+
+def test_기관_비교_프롬프트에_계산_금지와_출력_구조가_들어간다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    assert "직접 계산하지 마세요" in prompt
+    assert "## 1. 한눈에 보는 비교" in prompt
+    assert "## 2. 공통 보유 특징" in prompt
+    assert "## 3. 기관별 차이" in prompt
+    assert "## 4. 해석 시 주의사항" in prompt
+    assert "700~1,200자" in prompt
+
+
+def test_기관_비교_프롬프트에_전체_비교_표가_들어가지_않는다():
+    """비교 결과가 100줄이어도 프롬프트에는 상위 종목만 들어가야 합니다."""
+    left = [
+        {
+            "issuer_name": f"COMPANY {index:03d}",
+            "class_title": "COM",
+            "cusip": f"{index:09d}",
+            "reported_value": 1000 - index,
+            "shares": 100,
+            "share_type": "SH",
+            "put_call": "",
+        }
+        for index in range(60)
+    ]
+    right = [
+        {**row, "cusip": f"{900 + index:09d}", "issuer_name": f"OTHER {index:03d}"}
+        for index, row in enumerate(left[:40])
+    ]
+
+    comparison = compare_institution_portfolios(left, right)
+    payload = build_institution_comparison_briefing_payload(comparison)
+    prompt = build_institution_comparison_briefing_prompt(payload)
+
+    assert len(comparison) == 100
+
+    # 종목 한 줄에는 CUSIP이 한 번 나옵니다. 다섯 목록 * 최대 10개가 상한입니다.
+    assert prompt.count("(CUSIP ") <= payload["top_n"] * 5
+
+    # 어느 상위 목록에도 들지 않는 중간 순위 종목은 프롬프트에 없어야 합니다.
+    assert "COMPANY 030" not in prompt
+
+    # 내부 식별용 값과 공시 원문 관련 열 이름도 들어가지 않아야 합니다.
+    for forbidden in ("position_key", "informationTable", "left_reported_value"):
+        assert forbidden not in prompt
+
+
+def test_기관_비교_결과가_비어도_프롬프트를_만들_수_있다():
+    payload = build_institution_comparison_briefing_payload(
+        compare_institution_portfolios([], [])
+    )
+
+    prompt = build_institution_comparison_briefing_prompt(payload)
+
+    assert "해당 종목 없음" in prompt
+    assert "확인 불가" in prompt  # 기준일과 기관명이 없을 때의 표시
+    assert "공통 보유 종목 수: 0개" in prompt
+
+
+@pytest.mark.parametrize("payload", [None, {}, "문자열"])
+def test_기관_비교_입력_데이터가_없어도_프롬프트를_만들_수_있다(payload):
+    """입력 데이터가 비어 있어도 오류 없이 지시문만 담은 프롬프트를 만듭니다."""
+    prompt = build_institution_comparison_briefing_prompt(payload)
+
+    assert "## 1. 한눈에 보는 비교" in prompt
+    assert "해당 종목 없음" in prompt
+
+
+def test_기관_비교_프롬프트에_API_키가_들어가지_않는다(institution_payload):
+    prompt = build_institution_comparison_briefing_prompt(institution_payload)
+
+    assert FAKE_API_KEY not in prompt
 
 
 # ---------------------------------------------------------------------------

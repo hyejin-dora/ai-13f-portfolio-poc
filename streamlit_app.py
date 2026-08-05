@@ -23,6 +23,7 @@ from services.institution_comparison import (
     HOLDING_TYPE_COMMON,
     HOLDING_TYPE_LEFT_ONLY,
     HOLDING_TYPE_RIGHT_ONLY,
+    build_institution_comparison_briefing_payload,
     compare_institution_portfolios,
     find_common_report_dates,
     index_filings_by_report_date,
@@ -31,6 +32,7 @@ from services.institution_comparison import (
 from services.llm_client import (
     LlmApiError,
     build_briefing_prompt,
+    build_institution_comparison_briefing_prompt,
     generate_briefing,
 )
 from services.portfolio_analysis import (
@@ -84,6 +86,14 @@ INSTITUTION_COMPARISON_FILING_LIMIT = 8
 DEFAULT_LEFT_INSTITUTION = DEFAULT_MANAGER
 DEFAULT_RIGHT_INSTITUTION = "Pershing Square Capital Management"
 
+# 기관 비교 AI 브리핑 결과만 담는 화면 상태 키.
+# 단일 기관 브리핑(ai_briefing / ai_briefing_error)과 이름을 나누어 두었기 때문에,
+# 한쪽 브리핑을 지워도 다른 쪽은 화면에 그대로 남습니다.
+INSTITUTION_AI_BRIEFING_STATE_KEYS = (
+    "institution_ai_briefing",
+    "institution_ai_briefing_error",
+)
+
 # 기관 간 비교 화면에서만 쓰는 화면 상태 키.
 # 위 ANALYSIS_STATE_KEYS(단일 기관 분석)와 겹치지 않게 이름을 나누어 두었기 때문에,
 # 비교할 기관을 바꿔도 단일 기관 분석 결과는 지워지지 않습니다.
@@ -99,6 +109,8 @@ INSTITUTION_COMPARISON_STATE_KEYS = (
     "institution_comparison_warning",
     "institution_comparison_left_name",
     "institution_comparison_right_name",
+    # 비교 결과가 바뀌면 그 결과로 만든 AI 브리핑도 함께 지워야 하므로 포함합니다.
+    *INSTITUTION_AI_BRIEFING_STATE_KEYS,
 )
 
 # 비중 상위 몇 개 종목을 따로 보여줄지.
@@ -205,6 +217,24 @@ INSTITUTION_HOLDING_TYPE_ORDER = [
     HOLDING_TYPE_LEFT_ONLY,
     HOLDING_TYPE_RIGHT_ONLY,
 ]
+
+# 기관 비교 AI 브리핑을 만드는 동안 보여 줄 문구.
+INSTITUTION_BRIEFING_SPINNER_TEXT = (
+    "기관 비교 결과를 바탕으로 AI 브리핑을 생성하고 있습니다."
+)
+
+# 기관 비교 AI 브리핑 영역에 함께 표시하는 안내 문구.
+INSTITUTION_BRIEFING_NOTICE = (
+    "AI 브리핑은 Python으로 계산된 기관 비교 결과를 설명하며, "
+    "투자 추천이나 기관의 투자 의도 추정을 제공하지 않습니다."
+)
+
+# 기관 비교 AI 브리핑에서 예상하지 못한 오류가 났을 때 보여 줄 문구.
+# 내부 정보가 새지 않도록 원본 오류 내용은 담지 않습니다.
+INSTITUTION_BRIEFING_UNEXPECTED_ERROR = (
+    "기관 비교 AI 브리핑을 만드는 중 예상하지 못한 문제가 발생했습니다. "
+    "잠시 후 다시 시도해 주세요."
+)
 
 # 기관 이름을 지표·탭 제목에 넣을 때 쓰는 최대 길이(글자).
 # 이보다 길면 앞쪽 단어만 남깁니다(예: "Berkshire Hathaway" -> "Berkshire").
@@ -560,6 +590,88 @@ def reset_institution_comparison_state(state) -> None:
     """
     for key in INSTITUTION_COMPARISON_STATE_KEYS:
         state[key] = None
+
+
+def reset_institution_ai_briefing_state(state) -> None:
+    """기관 비교 AI 브리핑 결과만 지웁니다.
+
+    지우는 대상은 INSTITUTION_AI_BRIEFING_STATE_KEYS뿐이므로, 비교 표와 요약
+    지표는 화면에 그대로 남고 단일 기관 브리핑(ai_briefing)도 건드리지 않습니다.
+    """
+    for key in INSTITUTION_AI_BRIEFING_STATE_KEYS:
+        state[key] = None
+
+
+def sync_institution_briefing_report_date(state, report_date) -> bool:
+    """비교할 기준일이 직전과 달라졌으면 기관 비교 AI 브리핑만 지웁니다.
+
+    브리핑은 특정 분기의 비교 결과를 설명한 글이므로, 사용자가 기준일을 바꾸면
+    다른 분기의 설명이 화면에 남아 있지 않게 합니다. 비교 결과 자체는 지우지
+    않습니다(다시 비교하기 전까지 앞서 만든 표를 계속 볼 수 있게 하기 위함입니다).
+
+    Returns:
+        기준일이 바뀌어서 브리핑을 지웠으면 True, 같은 기준일이라 그대로 두었으면 False.
+    """
+    if state.get("active_institution_briefing_date") == report_date:
+        return False
+
+    reset_institution_ai_briefing_state(state)
+    state["active_institution_briefing_date"] = report_date
+    return True
+
+
+def institution_briefing_payload_from_state(state) -> dict:
+    """화면 상태에 담아 둔 기관 비교 결과로 AI 입력 데이터를 만듭니다.
+
+    계산과 상위 종목 선별은 institution_comparison 모듈이 맡고, 이 함수는 화면
+    상태에서 필요한 값만 꺼내 전달합니다. 원본 XML이나 전체 보유 종목 목록은
+    꺼내지 않습니다.
+    """
+    return build_institution_comparison_briefing_payload(
+        state.get("institution_comparison"),
+        state.get("institution_comparison_summary"),
+        report_date=state.get("institution_selected_report_date") or "",
+        left_manager_name=state.get("institution_comparison_left_name") or "기관 A",
+        right_manager_name=state.get("institution_comparison_right_name") or "기관 B",
+    )
+
+
+def run_institution_ai_briefing(state) -> None:
+    """기관 비교 AI 브리핑을 만들어 기관 비교 전용 화면 상태에 담습니다.
+
+    버튼을 눌렀을 때만 호출합니다. 화면이 다시 그려지는 것만으로는 호출되지
+    않으므로 Gemini API가 반복 호출되지 않습니다.
+
+    Gemini 호출과 오류 문구 변환은 단일 기관 브리핑과 같은
+    llm_client.generate_briefing을 그대로 씁니다. 성공하면
+    institution_ai_briefing에, 실패하면 institution_ai_briefing_error에 담고
+    예외를 밖으로 내보내지 않습니다(화면이 멈추지 않게 하기 위함입니다).
+    """
+    reset_institution_ai_briefing_state(state)
+
+    try:
+        # API 키와 모델명은 여기서 읽어 생성 함수에만 넘깁니다. 화면에 표시하지 않습니다.
+        gemini_api_key, gemini_model = read_gemini_settings()
+
+        prompt = build_institution_comparison_briefing_prompt(
+            institution_briefing_payload_from_state(state)
+        )
+
+        with st.spinner(INSTITUTION_BRIEFING_SPINNER_TEXT):
+            state["institution_ai_briefing"] = generate_briefing(
+                prompt,
+                api_key=gemini_api_key,
+                model_name=gemini_model,
+            )
+    except LookupError as error:
+        # GEMINI_API_KEY 또는 GEMINI_MODEL 설정이 없는 경우.
+        state["institution_ai_briefing_error"] = str(error)
+    except LlmApiError as error:
+        # llm_client가 만들어 준 한국어 안내 메시지를 그대로 보여줍니다.
+        state["institution_ai_briefing_error"] = str(error)
+    except Exception:
+        # 예상하지 못한 오류. 내부 정보가 새지 않도록 상세 내용은 보여주지 않습니다.
+        state["institution_ai_briefing_error"] = INSTITUTION_BRIEFING_UNEXPECTED_ERROR
 
 
 def sync_institution_pair(state, left_name: str, right_name: str) -> bool:
@@ -1467,6 +1579,10 @@ if left_institution is not None and right_institution is not None:
             key="institution_report_date_choice",
         )
 
+        # 기준일을 바꾸면 앞서 만든 AI 브리핑은 다른 분기의 설명이므로 지웁니다.
+        # (비교 표와 요약 지표는 그대로 두고, 브리핑만 다시 만들 수 있게 합니다.)
+        sync_institution_briefing_report_date(st.session_state, selected_report_date)
+
         left_comparison_filing = institution_filing_for_date(
             st.session_state.get("institution_left_filings_by_date"),
             selected_report_date,
@@ -1500,6 +1616,8 @@ if left_institution is not None and right_institution is not None:
             st.session_state["institution_comparison_summary"] = None
             st.session_state["institution_comparison_error"] = None
             st.session_state["institution_comparison_warning"] = None
+            # 비교를 새로 실행하면, 앞서 만든 AI 브리핑은 옛 결과 기준이므로 지웁니다.
+            reset_institution_ai_briefing_state(st.session_state)
             st.session_state["institution_selected_report_date"] = selected_report_date
             st.session_state["institution_comparison_filings"] = {
                 "left": left_comparison_filing,
@@ -1685,6 +1803,36 @@ if left_institution is not None and right_institution is not None:
                     "두 기관이 동일한 투자 의도나 전략을 가졌다는 뜻은 아닙니다. "
                     "보유 이유·기간·연계 포지션은 공시 데이터로 알 수 없습니다."
                 )
+
+                # --- D. 기관 비교 AI 브리핑 --------------------------------
+                # 위 비교 결과가 있을 때만(이 else 블록 안) 보여 주므로, 비교
+                # 결과가 없으면 브리핑을 만들 수 없습니다.
+                st.markdown("**AI 기관 비교 브리핑**")
+                st.caption(INSTITUTION_BRIEFING_NOTICE)
+                st.caption(
+                    "Gemini에는 위에서 Python이 계산한 요약 지표와 상위 종목 목록만 "
+                    "전달합니다. 공시 원문(XML)이나 전체 비교 표는 전달하지 않으며, "
+                    "Gemini는 새로운 숫자를 계산하지 않습니다."
+                )
+
+                # 버튼을 눌렀을 때만 API를 호출합니다. 화면이 다시 그려져도
+                # 자동으로 다시 호출되지 않습니다.
+                if st.button(
+                    "AI 기관 비교 브리핑 생성",
+                    type="primary",
+                    key="institution_ai_briefing_button",
+                ):
+                    run_institution_ai_briefing(st.session_state)
+
+                if st.session_state.get("institution_ai_briefing_error"):
+                    st.error(st.session_state["institution_ai_briefing_error"])
+                elif st.session_state.get("institution_ai_briefing"):
+                    st.warning(
+                        "AI 생성 결과는 투자 권유가 아니며 제공된 기관 비교 데이터만 "
+                        "설명합니다. 내용에 사실과 다른 부분이 있을 수 있으니 위의 "
+                        "표와 숫자를 함께 확인해 주세요."
+                    )
+                    st.markdown(st.session_state["institution_ai_briefing"])
 
 st.divider()
 

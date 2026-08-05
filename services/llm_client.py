@@ -6,6 +6,8 @@
 
 현재 구현된 기능:
     - 분석 결과를 프롬프트 문장으로 변환 (build_briefing_prompt)
+    - 기관 간 비교 결과를 프롬프트 문장으로 변환
+      (build_institution_comparison_briefing_prompt)
     - Gemini API 호출과 응답 텍스트 반환 (generate_briefing)
 
 중요한 원칙:
@@ -166,6 +168,117 @@ def build_briefing_prompt(
         "비중은 %, 비중 변화는 %포인트(%p)입니다.",
         "",
         "위 [분석 데이터]만 사용해 앞에서 지시한 5개 항목의 브리핑을 작성하세요.",
+    ]
+
+    return "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# 기관 간 비교 프롬프트 만들기
+# ---------------------------------------------------------------------------
+
+# 기관 비교 브리핑에서 Gemini에게 주는 역할과 규칙.
+# 위 단일 기관 브리핑과 규칙이 다르므로(두 기관을 견주는 글이라 단정 표현을 더
+# 조심해야 합니다) 안내문을 따로 두었습니다. 호출 방식과 오류 처리는 아래
+# generate_briefing을 그대로 함께 씁니다.
+_INSTITUTION_COMPARISON_INSTRUCTIONS = """당신은 미국 SEC 13F 공시 데이터를 일반 독자에게 설명하는 리서치 어시스턴트입니다.
+
+아래 [비교 데이터]는 Python 프로그램이 두 기관투자자의 13F 공시 원문에서 이미 계산해 둔
+결과입니다. 당신의 역할은 이 결과를 한국어로 설명하는 것뿐입니다.
+
+반드시 지킬 규칙:
+- [비교 데이터]에 있는 사실과 수치만 사용하세요. 데이터에 없는 내용을 만들어내지 마세요.
+- 직접 계산하지 마세요. 이미 제공된 계산 결과를 설명하기만 하세요.
+- 공통 보유를 두 기관이 동일한 투자 전략이나 같은 확신을 가졌다는 뜻으로 단정하지 마세요.
+- 비중 차이를 매수·매도의 증거나 특정 종목 선호의 직접 증거로 단정하지 마세요.
+- 기관의 투자 이유, 앞으로의 매매 계획, 주가 전망을 추정하지 마세요.
+- 투자 추천이나 매수·매도 의견을 제공하지 마세요.
+- 13F는 분기 말(기준일) 기준 공시이며 실시간 포트폴리오가 아니라는 점을 밝혀 주세요.
+- 이 비교가 13F 공시 대상 증권 범위에 한정된다는 점을 밝혀 주세요.
+- 공시 이후 실제 포트폴리오는 달라졌을 수 있다는 점을 밝혀 주세요.
+- 수치가 없거나 불분명하면 추정하지 말고, 확인할 수 없다고 쓰세요.
+- 비중은 %, 비중 차이는 %포인트(%p)입니다. 단위를 바꾸거나 환산하지 마세요.
+- 전문 용어는 짧게 풀어서 설명하고, 모든 문장을 한국어로 쓰세요.
+
+다음 4개 항목을 이 순서와 제목 그대로, Markdown 소제목(##)으로 작성하세요.
+## 1. 한눈에 보는 비교
+- 비교 대상 기관, 기준 분기, 종목 중복률, 비중 기준 중복도를 정리하세요.
+## 2. 공통 보유 특징
+- 공통 보유 중 비중이 큰 종목과 두 기관의 비중 차이를 설명하세요.
+- 공통 보유가 동일한 투자 의도를 의미하지 않는다는 주의를 함께 쓰세요.
+## 3. 기관별 차이
+- 기관 A의 상대적 비중이 큰 종목, 기관 B의 상대적 비중이 큰 종목,
+  그리고 각 기관이 단독으로 보유한 상위 종목을 설명하세요.
+## 4. 해석 시 주의사항
+- 13F 공시 시차, 공개 범위 제한, 투자 의도 추정 불가,
+  투자 추천이 아니라는 점을 정리하세요.
+
+전체 분량은 한국어 700~1,200자 범위로 쓰세요. 지나치게 길게 쓰지 마세요.
+"""
+
+
+def build_institution_comparison_briefing_prompt(payload) -> str:
+    """기관 간 비교 결과를 Gemini에 보낼 프롬프트 문자열로 바꿉니다.
+
+    Args:
+        payload: institution_comparison.build_institution_comparison_briefing_payload가
+            돌려준 딕셔너리. 이 함수는 그 안에 있는 값만 문장으로 옮깁니다.
+
+    Returns:
+        Gemini에 그대로 넘길 수 있는 프롬프트 문자열.
+
+    Note:
+        전체 비교 표나 공시 원문은 넣지 않습니다. payload에 이미 상위 종목만
+        골라 담겨 있으므로, 비교 결과가 수백 줄이어도 프롬프트 크기는 일정합니다.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    summary = payload.get("summary") or {}
+
+    left_name = _text(payload.get("left_manager_name"))
+    right_name = _text(payload.get("right_manager_name"))
+    top_n = _count(payload.get("top_n"))
+
+    sections = [
+        _INSTITUTION_COMPARISON_INSTRUCTIONS,
+        "[비교 데이터]",
+        "",
+        "## 비교 기준",
+        f"- 기준일(report_date, 분기 말): {_text(payload.get('report_date'))}",
+        f"- 기관 A: {left_name}",
+        f"- 기관 B: {right_name}",
+        "",
+        "## 요약 지표",
+        f"- 공통 보유 종목 수: {_count(summary.get('common_count'))}개",
+        f"- 기관 A 단독 보유 종목 수: {_count(summary.get('left_only_count'))}개",
+        f"- 기관 B 단독 보유 종목 수: {_count(summary.get('right_only_count'))}개",
+        f"- 두 기관 보유를 합친 고유 종목 수: {_count(summary.get('union_count'))}개",
+        f"- 종목 중복률: {_percent(summary.get('security_overlap_pct'), signed=False)}",
+        f"- 비중 기준 중복도: "
+        f"{_percent(summary.get('weighted_overlap_pct'), signed=False)}",
+        "",
+        f"## 공통 보유 중 비중이 큰 종목 (최대 {top_n}개)",
+        _format_institution_rows(payload.get("top_common_holdings")),
+        "",
+        f"## 공통 보유 중 기관 A 비중이 더 큰 종목 (최대 {top_n}개)",
+        _format_institution_rows(payload.get("top_left_heavier_holdings")),
+        "",
+        f"## 공통 보유 중 기관 B 비중이 더 큰 종목 (최대 {top_n}개)",
+        _format_institution_rows(payload.get("top_right_heavier_holdings")),
+        "",
+        f"## 기관 A 단독 보유 중 비중 상위 종목 (최대 {top_n}개)",
+        _format_institution_rows(payload.get("top_left_only_holdings")),
+        "",
+        f"## 기관 B 단독 보유 중 비중 상위 종목 (최대 {top_n}개)",
+        _format_institution_rows(payload.get("top_right_only_holdings")),
+        "",
+        "값 출처 안내: 비중(%)은 각 기관의 13F 공시 평가금액 합계에서 해당 종목이 "
+        "차지하는 비율입니다. 비중 차이(%p)는 '기관 A 비중 - 기관 B 비중'이므로 "
+        "양수면 기관 A가 더 많이 담은 종목, 음수면 기관 B가 더 많이 담은 종목입니다. "
+        "종목 중복률은 두 기관 보유를 합친 종목 수 중 공통 보유가 차지하는 비율이고, "
+        "비중 기준 중복도는 공통 보유 종목마다 두 기관 비중 중 작은 값을 더한 값입니다. "
+        "위 목록은 상위 종목만 골라 담은 것이므로 두 기관의 전체 보유 종목이 아닙니다.",
+        "",
+        "위 [비교 데이터]만 사용해 앞에서 지시한 4개 항목의 브리핑을 작성하세요.",
     ]
 
     return "\n".join(sections)
@@ -358,6 +471,62 @@ def _format_row(row) -> str:
         f"보유수량 변화 {_number(row.get('shares_change'), signed=True)}주, "
         f"구분 {_text(row.get('change_status'))}"
     )
+
+
+def _format_institution_rows(records) -> str:
+    """기관 비교 입력 데이터의 종목 목록을 프롬프트에 넣을 문장으로 바꿉니다."""
+    if not records:
+        return "- 해당 종목 없음"
+
+    return "\n".join(_format_institution_row(record) for record in records)
+
+
+def _format_institution_row(record) -> str:
+    """종목 한 줄을 사람이 읽는 문장으로 바꿉니다.
+
+    비중 항목은 입력 데이터에 담겨 있는 것만 씁니다. 예를 들어 한쪽만 보유한
+    종목에는 그 기관의 비중만 담겨 있으므로 반대쪽 비중은 문장에 넣지 않습니다.
+    """
+    record = record if isinstance(record, dict) else {}
+
+    name = _text(record.get("issuer_name") or record.get("cusip"))
+    details = (
+        f"CUSIP {_text(record.get('cusip'))}, "
+        f"옵션 구분 {_option_text(record.get('put_call'))}, "
+        f"수량 단위 {_text(record.get('share_type'))}"
+    )
+
+    weights = []
+    if "left_weight_pct" in record:
+        weights.append(
+            f"기관 A 비중 {_percent(record.get('left_weight_pct'), signed=False)}"
+        )
+    if "right_weight_pct" in record:
+        weights.append(
+            f"기관 B 비중 {_percent(record.get('right_weight_pct'), signed=False)}"
+        )
+    if "weight_gap_pct_point" in record:
+        weights.append(
+            f"비중 차이 {_percent(record.get('weight_gap_pct_point'))}p"
+        )
+
+    if not weights:
+        return f"- {name} ({details})"
+
+    return f"- {name} ({details}): {', '.join(weights)}"
+
+
+def _option_text(value) -> str:
+    """옵션 구분(put_call)을 문장에 넣을 표현으로 바꿉니다.
+
+    13F에서 이 칸이 비어 있으면 옵션이 아닌 일반 보유라는 뜻이므로, '확인 불가'가
+    아니라 '없음(일반 주식 보유)'으로 적어 Gemini가 잘못 해석하지 않게 합니다.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "없음(일반 주식 보유)"
+
+    text = str(value).strip()
+    return text if text else "없음(일반 주식 보유)"
 
 
 def _text(value) -> str:

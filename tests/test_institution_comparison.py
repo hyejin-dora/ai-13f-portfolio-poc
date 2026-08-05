@@ -5,17 +5,21 @@
 """
 
 import copy
+import json
 
 import pandas as pd
 import pytest
 
 from services.institution_comparison import (
+    BRIEFING_SUMMARY_KEYS,
     HOLDING_TYPE,
     HOLDING_TYPE_COMMON,
     HOLDING_TYPE_LEFT_ONLY,
     HOLDING_TYPE_RIGHT_ONLY,
     INSTITUTION_COMPARISON_COLUMNS,
     PORTFOLIO_COLUMNS,
+    TOP_BRIEFING_COUNT,
+    build_institution_comparison_briefing_payload,
     compare_institution_portfolios,
     find_common_report_dates,
     index_filings_by_report_date,
@@ -666,3 +670,270 @@ def test_summary_percentages_stay_within_range(comparison):
 
     assert 0.0 <= summary["security_overlap_pct"] <= 100.0
     assert 0.0 <= summary["weighted_overlap_pct"] <= 100.0
+
+
+# ---------------------------------------------------------------------------
+# AI 브리핑 입력 데이터 (build_institution_comparison_briefing_payload)
+#
+# Gemini에 넘기는 값은 이 함수가 돌려주는 딕셔너리뿐입니다. 그래서 여기서는
+# '무엇이 담기는지'와 함께 '무엇이 담기지 않는지'도 확인합니다.
+# ---------------------------------------------------------------------------
+
+# 종목 목록에 담기는 항목 외에는 넘기지 않는지 확인할 때 쓰는 목록.
+BRIEFING_HOLDING_LIST_KEYS = [
+    "top_common_holdings",
+    "top_left_heavier_holdings",
+    "top_right_heavier_holdings",
+    "top_left_only_holdings",
+    "top_right_only_holdings",
+]
+
+# 종목 한 줄에 담을 수 있는 항목. 이 밖의 항목(공시 평가금액, 보유수량,
+# class_title, 내부 포지션 키 등)은 담기지 않아야 합니다.
+ALLOWED_BRIEFING_HOLDING_FIELDS = {
+    "issuer_name",
+    "cusip",
+    "put_call",
+    "share_type",
+    "left_weight_pct",
+    "right_weight_pct",
+    "weight_gap_pct_point",
+}
+
+
+@pytest.fixture
+def payload(comparison):
+    """예시 비교 결과로 만든 AI 브리핑 입력 데이터."""
+    return build_institution_comparison_briefing_payload(
+        comparison,
+        summarize_institution_comparison(comparison),
+        report_date="2025-06-30",
+        left_manager_name="Berkshire Hathaway",
+        right_manager_name="Pershing Square Capital Management",
+    )
+
+
+def many_holdings(count, first_cusip=0):
+    """비중이 서로 다른 보유 종목을 count개 만듭니다."""
+    return [
+        holding(
+            f"{first_cusip + index:09d}",
+            f"COMPANY {first_cusip + index:03d}",
+            reported_value=1000 - index,
+            shares=100,
+        )
+        for index in range(count)
+    ]
+
+
+def test_briefing_payload_keeps_basic_information(payload):
+    """기준일과 두 기관 이름이 그대로 담겨야 한다."""
+    assert payload["report_date"] == "2025-06-30"
+    assert payload["left_manager_name"] == "Berkshire Hathaway"
+    assert payload["right_manager_name"] == "Pershing Square Capital Management"
+
+
+def test_briefing_payload_keeps_summary_metrics(payload):
+    """요약 지표 여섯 개가 계산된 값 그대로 담겨야 한다."""
+    assert set(payload["summary"]) == set(BRIEFING_SUMMARY_KEYS)
+    assert payload["summary"] == {
+        "common_count": 2,
+        "left_only_count": 1,
+        "right_only_count": 1,
+        "union_count": 4,
+        # 공통 2종목 / 전체 4종목 = 50%
+        "security_overlap_pct": 50.0,
+        # min(60, 25) + min(30, 50) = 55%
+        "weighted_overlap_pct": 55.0,
+    }
+
+
+def test_briefing_payload_recalculates_summary_when_missing(comparison):
+    """요약을 넘기지 않아도 같은 공식으로 채워야 한다."""
+    without_summary = build_institution_comparison_briefing_payload(comparison)
+
+    assert without_summary["summary"] == summarize_institution_comparison(comparison)
+
+
+def test_briefing_payload_summary_ignores_unexpected_keys(comparison):
+    """요약에 다른 값이 섞여 있어도 정해진 지표만 담아야 한다."""
+    summary = dict(summarize_institution_comparison(comparison))
+    summary["holdings_xml"] = "<informationTable>...</informationTable>"
+
+    result = build_institution_comparison_briefing_payload(comparison, summary)
+
+    assert set(result["summary"]) == set(BRIEFING_SUMMARY_KEYS)
+    assert "holdings_xml" not in json.dumps(result, ensure_ascii=False)
+
+
+def test_briefing_payload_sorts_common_holdings_by_larger_weight(payload):
+    """공통 보유 목록은 두 기관 비중 중 큰 값이 큰 종목부터 담아야 한다."""
+    names = [row["issuer_name"] for row in payload["top_common_holdings"]]
+
+    # APPLE은 기관 A에서 60%, COCA COLA는 기관 B에서 50%입니다.
+    assert names == ["APPLE INC", "COCA COLA CO"]
+
+
+def test_briefing_payload_splits_heavier_holdings_by_side(payload):
+    """비중이 더 큰 쪽에 따라 종목이 나뉘어 담겨야 한다."""
+    left_heavier = payload["top_left_heavier_holdings"]
+    right_heavier = payload["top_right_heavier_holdings"]
+
+    # APPLE: 60% - 25% = +35%p (기관 A가 더 큼)
+    assert [row["issuer_name"] for row in left_heavier] == ["APPLE INC"]
+    assert left_heavier[0]["weight_gap_pct_point"] == pytest.approx(35.0)
+
+    # COCA COLA: 30% - 50% = -20%p (기관 B가 더 큼)
+    assert [row["issuer_name"] for row in right_heavier] == ["COCA COLA CO"]
+    assert right_heavier[0]["weight_gap_pct_point"] == pytest.approx(-20.0)
+
+
+def test_briefing_payload_keeps_only_holdings_of_each_side(payload):
+    """단독 보유 목록에는 그 기관만 보유한 종목이 담겨야 한다."""
+    left_only = payload["top_left_only_holdings"]
+    right_only = payload["top_right_only_holdings"]
+
+    assert [row["issuer_name"] for row in left_only] == ["AMERICAN EXPRESS CO"]
+    assert left_only[0]["left_weight_pct"] == pytest.approx(10.0)
+
+    assert [row["issuer_name"] for row in right_only] == ["MICROSOFT CORP"]
+    assert right_only[0]["right_weight_pct"] == pytest.approx(25.0)
+
+
+def test_briefing_payload_limits_each_list_to_top_n():
+    """종목이 많아도 각 목록은 top_n개를 넘지 않아야 한다."""
+    left = many_holdings(60)
+    # 기관 B는 같은 60종목에 더해 단독 보유 40종목을 가집니다.
+    right = [
+        holding(row["cusip"], row["issuer_name"], reported_value=500, shares=50)
+        for row in left
+    ] + many_holdings(40, first_cusip=900)
+
+    comparison = compare_institution_portfolios(left, right)
+    result = build_institution_comparison_briefing_payload(comparison)
+
+    assert result["top_n"] == TOP_BRIEFING_COUNT
+    for key in BRIEFING_HOLDING_LIST_KEYS:
+        assert len(result[key]) <= TOP_BRIEFING_COUNT
+
+    # 실제로 상한에 걸리는 목록이 있어야 이 검증이 의미가 있습니다.
+    assert len(result["top_common_holdings"]) == TOP_BRIEFING_COUNT
+    assert len(result["top_right_only_holdings"]) == TOP_BRIEFING_COUNT
+
+
+def test_briefing_payload_top_n_can_be_changed(comparison):
+    """top_n을 줄이면 그만큼만 담아야 한다."""
+    result = build_institution_comparison_briefing_payload(comparison, top_n=1)
+
+    assert result["top_n"] == 1
+    assert len(result["top_common_holdings"]) == 1
+
+
+def test_briefing_payload_does_not_include_whole_comparison_table():
+    """전체 비교 표나 공시 원문 값이 담기지 않아야 한다."""
+    left = many_holdings(60)
+    comparison = compare_institution_portfolios(left, many_holdings(40, first_cusip=900))
+    result = build_institution_comparison_briefing_payload(comparison)
+
+    # 목록에 담긴 종목 수는 전체 비교 결과(100줄)보다 훨씬 적어야 합니다.
+    total_rows = sum(len(result[key]) for key in BRIEFING_HOLDING_LIST_KEYS)
+    assert total_rows < len(comparison)
+
+    # 종목 한 줄에는 정해진 항목만 담기고, 금액·수량·내부 키는 담기지 않습니다.
+    for key in BRIEFING_HOLDING_LIST_KEYS:
+        for row in result[key]:
+            assert set(row) <= ALLOWED_BRIEFING_HOLDING_FIELDS
+
+    text = json.dumps(result, ensure_ascii=False)
+    for forbidden in (
+        POSITION_KEY,
+        "class_title",
+        "left_reported_value",
+        "right_reported_value",
+        "left_shares",
+        "right_shares",
+        HOLDING_TYPE,
+    ):
+        assert forbidden not in text
+
+
+def test_briefing_payload_is_json_serializable(payload):
+    """JSON으로 그대로 바꿀 수 있어야 한다(numpy 타입이 남지 않아야 한다)."""
+    restored = json.loads(json.dumps(payload, ensure_ascii=False))
+
+    assert restored == payload
+    for key in BRIEFING_HOLDING_LIST_KEYS:
+        for row in payload[key]:
+            for field, value in row.items():
+                assert isinstance(value, (str, int, float)), field
+                assert type(value) in (str, int, float), field
+
+
+def test_briefing_payload_has_no_nan_values():
+    """값이 비어 있는 비교 결과에서도 NaN이 남지 않아야 한다."""
+    table = pd.DataFrame(
+        {
+            "issuer_name": ["APPLE INC", None],
+            "cusip": [APPLE, COCA_COLA],
+            "put_call": [None, ""],
+            "share_type": ["SH", None],
+            "left_weight_pct": [60.0, float("nan")],
+            "right_weight_pct": [float("nan"), 40.0],
+            "weight_gap_pct_point": [float("nan"), float("nan")],
+            HOLDING_TYPE: [HOLDING_TYPE_COMMON, HOLDING_TYPE_LEFT_ONLY],
+        }
+    )
+
+    result = build_institution_comparison_briefing_payload(table)
+
+    for key in BRIEFING_HOLDING_LIST_KEYS:
+        for row in result[key]:
+            for field, value in row.items():
+                assert not pd.isna(value), f"{key}.{field}에 NaN이 남았습니다."
+
+
+def test_briefing_payload_handles_empty_comparison():
+    """비교 결과가 비어도 안전하게 입력 데이터를 만들어야 한다."""
+    result = build_institution_comparison_briefing_payload(
+        compare_institution_portfolios([], [])
+    )
+
+    assert result["summary"]["union_count"] == 0
+    assert result["summary"]["security_overlap_pct"] == 0.0
+    for key in BRIEFING_HOLDING_LIST_KEYS:
+        assert result[key] == []
+
+
+@pytest.mark.parametrize("empty_comparison", [None, [], pd.DataFrame()])
+def test_briefing_payload_handles_missing_comparison(empty_comparison):
+    """비교 결과가 아예 없어도 오류 없이 빈 목록을 돌려줘야 한다."""
+    result = build_institution_comparison_briefing_payload(empty_comparison)
+
+    assert result["report_date"] == ""
+    for key in BRIEFING_HOLDING_LIST_KEYS:
+        assert result[key] == []
+
+
+def test_briefing_payload_does_not_modify_input(comparison):
+    """입력 비교 표를 바꾸지 않아야 한다."""
+    before = comparison.copy(deep=True)
+
+    build_institution_comparison_briefing_payload(comparison)
+
+    pd.testing.assert_frame_equal(comparison, before)
+
+
+def test_briefing_payload_keeps_option_positions_separate():
+    """같은 회사의 옵션 보유는 별개의 줄로 담겨야 한다."""
+    left = [holding(APPLE, "APPLE INC", reported_value=1000)]
+    right = [
+        holding(APPLE, "APPLE INC", reported_value=1000),
+        holding(APPLE, "APPLE INC", reported_value=1000, put_call="Put"),
+    ]
+
+    result = build_institution_comparison_briefing_payload(
+        compare_institution_portfolios(left, right)
+    )
+
+    assert [row["put_call"] for row in result["top_common_holdings"]] == [""]
+    assert [row["put_call"] for row in result["top_right_only_holdings"]] == ["Put"]

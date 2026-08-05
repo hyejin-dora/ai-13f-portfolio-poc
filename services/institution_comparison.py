@@ -11,6 +11,8 @@
     - 한 기관의 보유 종목을 비중까지 계산해 정리 (prepare_institution_portfolio)
     - 두 기관 포트폴리오를 포지션 단위로 맞춰 비교 (compare_institution_portfolios)
     - 비교 결과 요약: 종목 중복률과 비중 중복도 (summarize_institution_comparison)
+    - AI 브리핑에 넘길 입력 데이터 만들기
+      (build_institution_comparison_briefing_payload)
 
 주의:
     - 포지션을 구분하는 기준은 portfolio_analysis 모듈의 '포지션 키'
@@ -111,6 +113,55 @@ _TEXT_COLUMNS = ["issuer_name", "class_title", "cusip", "put_call", "share_type"
 # 비율(%)이 가질 수 있는 범위.
 _MIN_PERCENT = 0.0
 _MAX_PERCENT = 100.0
+
+# AI 브리핑 입력 데이터에서 각 종목 목록에 담을 기본 개수 상한.
+# 비교 결과가 수백 줄이어도 이 개수만 넘어갑니다.
+TOP_BRIEFING_COUNT = 10
+
+# AI 브리핑 입력 데이터에 담는 요약 지표 이름.
+# 요약 딕셔너리에 다른 값이 섞여 있어도 이 목록에 있는 값만 골라 담습니다.
+BRIEFING_SUMMARY_KEYS = (
+    "common_count",
+    "left_only_count",
+    "right_only_count",
+    "union_count",
+    "security_overlap_pct",
+    "weighted_overlap_pct",
+)
+
+# AI 브리핑 입력 데이터에서 종목 하나를 설명할 때 쓰는 항목.
+# 여기 없는 항목(공시 평가금액, 보유수량, class_title, 내부 포지션 키 등)은
+# 브리핑에 필요하지 않으므로 담지 않습니다.
+_BRIEFING_COMMON_FIELDS = (
+    "issuer_name",
+    "cusip",
+    "put_call",
+    "share_type",
+    "left_weight_pct",
+    "right_weight_pct",
+    "weight_gap_pct_point",
+)
+_BRIEFING_LEFT_ONLY_FIELDS = (
+    "issuer_name",
+    "cusip",
+    "put_call",
+    "share_type",
+    "left_weight_pct",
+)
+_BRIEFING_RIGHT_ONLY_FIELDS = (
+    "issuer_name",
+    "cusip",
+    "put_call",
+    "share_type",
+    "right_weight_pct",
+)
+
+# 위 항목 중 숫자로 담아야 하는 것.
+_BRIEFING_NUMBER_FIELDS = (
+    "left_weight_pct",
+    "right_weight_pct",
+    "weight_gap_pct_point",
+)
 
 
 def index_filings_by_report_date(filings) -> dict[str, dict]:
@@ -363,6 +414,101 @@ def summarize_institution_comparison(comparison: pd.DataFrame) -> dict:
     }
 
 
+def build_institution_comparison_briefing_payload(
+    comparison,
+    summary=None,
+    report_date="",
+    left_manager_name="",
+    right_manager_name="",
+    top_n: int = TOP_BRIEFING_COUNT,
+) -> dict:
+    """기관 비교 결과에서 AI 브리핑에 넘길 입력 데이터만 골라 담습니다.
+
+    Gemini에는 이 함수가 돌려주는 딕셔너리만 넘깁니다. 공시 원문(XML), 전체 보유
+    종목 목록, 전체 비교 표는 넘기지 않습니다. 비교 결과가 수백 줄이어도 각 목록은
+    top_n개까지만 담기므로 요청 크기가 일정하게 유지됩니다.
+
+    Args:
+        comparison: compare_institution_portfolios가 돌려준 표(또는 같은 구조의 목록).
+        summary: summarize_institution_comparison이 돌려준 요약 딕셔너리.
+            비어 있으면 이 함수가 같은 함수를 호출해 다시 계산합니다.
+            (요약 계산 공식은 여기서 다시 구현하지 않습니다.)
+        report_date: 비교 기준일(분기 말일) 문자열.
+        left_manager_name: 기관 A 이름.
+        right_manager_name: 기관 B 이름.
+        top_n: 각 종목 목록에 담을 최대 개수. 기본값은 10입니다.
+
+    Returns:
+        JSON으로 그대로 바꿀 수 있는 딕셔너리. 값은 모두 파이썬 기본 타입
+        (str, int, float, list, dict)이며 pandas NaN이나 numpy 숫자 타입은 남지
+        않습니다. 담기는 항목은 다음과 같습니다.
+            report_date, left_manager_name, right_manager_name, top_n
+            summary: BRIEFING_SUMMARY_KEYS의 여섯 개 요약 지표
+            top_common_holdings: 공통 보유 중 두 기관 비중이 큰 종목
+            top_left_heavier_holdings: 공통 보유 중 기관 A 비중이 더 큰 종목
+            top_right_heavier_holdings: 공통 보유 중 기관 B 비중이 더 큰 종목
+            top_left_only_holdings: 기관 A 단독 보유 중 비중 상위 종목
+            top_right_only_holdings: 기관 B 단독 보유 중 비중 상위 종목
+
+    Note:
+        - 입력 표는 복사해서 다루므로 원본은 바뀌지 않습니다.
+        - 새로운 계산은 하지 않습니다. 비중과 비중 차이는 이미 계산된 값을 그대로
+          옮기고, 이 함수는 '어떤 줄을 담을지' 고르는 일만 합니다.
+        - '비중이 더 큰 종목' 목록은 공통 보유 종목만 대상으로 합니다. 한쪽만
+          보유한 종목은 비중 차이를 견주는 의미가 없어 단독 보유 목록으로 따로
+          담습니다.
+        - 비교할 내용이 없으면 요약값은 0, 각 목록은 빈 목록이 됩니다.
+    """
+    table = _briefing_frame(comparison)
+    limit = _briefing_limit(top_n)
+
+    common = table[table[HOLDING_TYPE] == HOLDING_TYPE_COMMON].copy()
+    left_only = table[table[HOLDING_TYPE] == HOLDING_TYPE_LEFT_ONLY]
+    right_only = table[table[HOLDING_TYPE] == HOLDING_TYPE_RIGHT_ONLY]
+
+    # 공통 보유 상위는 두 기관 비중 중 큰 값을 기준으로 고릅니다.
+    # (화면 표의 정렬 기준과 같습니다.) 정렬에만 쓰는 임시 열입니다.
+    common["_max_weight"] = common[["left_weight_pct", "right_weight_pct"]].max(axis=1)
+
+    return {
+        "report_date": _clean_text(report_date),
+        "left_manager_name": _clean_text(left_manager_name),
+        "right_manager_name": _clean_text(right_manager_name),
+        "top_n": limit,
+        "summary": _briefing_summary(summary, table),
+        "top_common_holdings": _briefing_rows(
+            _briefing_top(common, "_max_weight", limit, ascending=False),
+            _BRIEFING_COMMON_FIELDS,
+        ),
+        "top_left_heavier_holdings": _briefing_rows(
+            _briefing_top(
+                common[common["weight_gap_pct_point"] > 0],
+                "weight_gap_pct_point",
+                limit,
+                ascending=False,
+            ),
+            _BRIEFING_COMMON_FIELDS,
+        ),
+        "top_right_heavier_holdings": _briefing_rows(
+            _briefing_top(
+                common[common["weight_gap_pct_point"] < 0],
+                "weight_gap_pct_point",
+                limit,
+                ascending=True,
+            ),
+            _BRIEFING_COMMON_FIELDS,
+        ),
+        "top_left_only_holdings": _briefing_rows(
+            _briefing_top(left_only, "left_weight_pct", limit, ascending=False),
+            _BRIEFING_LEFT_ONLY_FIELDS,
+        ),
+        "top_right_only_holdings": _briefing_rows(
+            _briefing_top(right_only, "right_weight_pct", limit, ascending=False),
+            _BRIEFING_RIGHT_ONLY_FIELDS,
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 내부 보조 함수 (모듈 밖에서 직접 쓰지 않습니다)
 # ---------------------------------------------------------------------------
@@ -457,6 +603,110 @@ def _clamp_percent(value: float) -> float:
         return 0.0
 
     return min(max(number, _MIN_PERCENT), _MAX_PERCENT)
+
+
+def _briefing_frame(comparison) -> pd.DataFrame:
+    """AI 입력 데이터를 만들 때 쓰는, 필요한 열만 남긴 표를 만듭니다.
+
+    원본을 바꾸지 않기 위해 값을 새 표에 옮겨 담습니다. 열이 없거나 값이 비어
+    있어도(NaN) 여기서 0이나 빈 문자열로 바뀌므로, 뒤 단계에 NaN이 남지 않습니다.
+    """
+    if isinstance(comparison, pd.DataFrame):
+        source = comparison.copy()
+    else:
+        source = pd.DataFrame(list(comparison or []))
+
+    return pd.DataFrame(
+        {
+            "issuer_name": _text_column(source, "issuer_name"),
+            "cusip": _text_column(source, "cusip"),
+            "put_call": _text_column(source, "put_call"),
+            "share_type": _text_column(source, "share_type"),
+            "left_weight_pct": _numeric_column(source, "left_weight_pct"),
+            "right_weight_pct": _numeric_column(source, "right_weight_pct"),
+            "weight_gap_pct_point": _numeric_column(source, "weight_gap_pct_point"),
+            HOLDING_TYPE: _text_column(source, HOLDING_TYPE),
+        }
+    )
+
+
+def _briefing_limit(top_n) -> int:
+    """각 목록에 담을 개수를 정합니다. 숫자가 아니거나 음수면 기본값을 씁니다."""
+    try:
+        limit = int(top_n)
+    except (TypeError, ValueError):
+        return TOP_BRIEFING_COUNT
+
+    return limit if limit >= 0 else TOP_BRIEFING_COUNT
+
+
+def _briefing_top(
+    rows: pd.DataFrame, sort_column: str, limit: int, ascending: bool
+) -> pd.DataFrame:
+    """정렬 기준에 따라 상위 limit개 줄만 고릅니다.
+
+    비중이 같은 줄이 있어도 순서가 매번 같도록 마지막 기준으로 CUSIP을 둡니다.
+    """
+    if rows.empty or limit <= 0:
+        return rows.head(0)
+
+    ordered = rows.sort_values(
+        [sort_column, "cusip"], ascending=[ascending, True]
+    )
+    return ordered.head(limit)
+
+
+def _briefing_rows(rows: pd.DataFrame, fields) -> list[dict]:
+    """고른 줄을 JSON으로 바꿀 수 있는 딕셔너리 목록으로 옮깁니다.
+
+    fields에 적힌 항목만 담습니다. 숫자는 파이썬 float, 글자는 str이 되므로
+    numpy 타입이나 NaN이 남지 않습니다.
+    """
+    records = []
+
+    for _, row in rows.iterrows():
+        record = {}
+        for field in fields:
+            if field in _BRIEFING_NUMBER_FIELDS:
+                record[field] = _briefing_number(row.get(field))
+            else:
+                record[field] = _clean_text(row.get(field))
+        records.append(record)
+
+    return records
+
+
+def _briefing_number(value) -> float:
+    """값을 파이썬 float로 바꿉니다. 숫자로 다룰 수 없으면 0.0으로 둡니다."""
+    number = pd.to_numeric(value, errors="coerce")
+
+    if number is None or pd.isna(number):
+        return 0.0
+
+    return float(number)
+
+
+def _briefing_summary(summary, table: pd.DataFrame) -> dict:
+    """AI 입력 데이터에 담을 요약 지표만 골라 파이썬 기본 타입으로 바꿉니다.
+
+    요약 딕셔너리가 없거나 비어 있으면 summarize_institution_comparison을 불러
+    같은 공식으로 다시 계산합니다. 여기서 새로운 공식을 만들지는 않습니다.
+    """
+    if isinstance(summary, dict) and summary:
+        values = summary
+    else:
+        values = summarize_institution_comparison(table)
+
+    result = {}
+    for key in BRIEFING_SUMMARY_KEYS:
+        number = pd.to_numeric(values.get(key), errors="coerce")
+        if number is None or pd.isna(number):
+            number = 0
+
+        # 개수는 정수, 비율은 소수로 담습니다.
+        result[key] = int(number) if key.endswith("_count") else float(number)
+
+    return result
 
 
 def _empty_portfolio() -> pd.DataFrame:
