@@ -12,6 +12,8 @@ SEC 조회 결과를 잠시 보관해 두고 재사용하는 캐시도 이 파�
 services/sec_client.py는 캐시를 모른 채 순수한 조회 함수로 남습니다.
 """
 
+import base64
+from io import BytesIO
 from pathlib import Path
 
 import altair as alt
@@ -257,6 +259,836 @@ TOP_WEIGHT_CHANGE_COUNT = 10
 # 국내 관행에 맞춰 확대는 빨강, 축소는 파랑을 씁니다.
 COLOR_INCREASE = "#e34948"
 COLOR_DECREASE = "#2a78d6"
+
+# 차트의 축·범례 글자와 격자선 색.
+# 표를 다크로 만들기 위해 Streamlit 테마 자체를 어둡게 잡았기 때문에,
+# 차트가 그 테마를 따라가 흐릿해지지 않도록 여기서 밝은 배경용 색을 못 박습니다.
+CHART_LABEL_COLOR = "#000000"
+CHART_GRID_COLOR = "rgba(0, 0, 0, 0.12)"
+
+# ---------------------------------------------------------------------------
+# 화면 디자인(에디토리얼 컬러 시스템)
+#
+# 아래 값들은 '보이는 모습'만 정합니다. 계산·조회·상태 관리와는 무관하며,
+# 이 블록을 통째로 지워도 분석 기능은 그대로 동작합니다.
+# ---------------------------------------------------------------------------
+
+# 사이트 전체 배경(따뜻한 종이색).
+COLOR_BACKGROUND = "#D4CFC2"
+# 메인 제목과 주요 헤딩(짙은 녹색).
+COLOR_HEADING = "#00533E"
+# 상세 설명과 일반 본문.
+COLOR_BODY = "#000000"
+# 주요 CTA(실행 버튼)와 활성 상태.
+COLOR_ACCENT = "#F7633D"
+# 보조 강조와 일부 테두리.
+COLOR_SECONDARY = "#A35D3F"
+# 배지, 작은 태그, 포인트 요소.
+COLOR_BADGE = "#ECB97A"
+
+# --- 표(다크 테이블) 전용 색 ------------------------------------------------
+#
+# 사이트 배경은 밝은 베이지지만, 표만은 검은색 기반의 다크 테이블로 둡니다.
+#
+# 주의: st.dataframe의 열 헤더와 칸은 HTML이 아니라 <canvas>(그림판)에 그려져
+# CSS가 닿지 않습니다. 그래서 아래 값들은 `.streamlit/config.toml`의 [theme]에도
+# 똑같이 적어 두어야 하며, 두 곳이 어긋났는지는 테스트에서 확인합니다.
+
+# 열 헤더 배경(검정).
+COLOR_TABLE_HEADER_BG = "#000000"
+# 본문 칸 배경(매우 어두운 차콜).
+COLOR_TABLE_BG = "#0F0F0F"
+# 본문·헤더 글씨(흰색).
+COLOR_TABLE_TEXT = "#FFFFFF"
+# 표 안의 보조 텍스트. 어두운 회색 대신 밝은 베이지를 써서 대비를 높입니다.
+COLOR_TABLE_MUTED_TEXT = "#D4CFC2"
+# 행·열 구분선. #A35D3F를 어두운 표 배경 위에 옅게 얹은 값입니다.
+COLOR_TABLE_BORDER = "#593627"
+# 마우스를 올렸을 때 행 색. #ECB97A를 아주 옅게 얹은 값입니다.
+COLOR_TABLE_HOVER = "#30281F"
+
+# Streamlit이 hover 색을 만들 때 섞는 재료(config.toml의 secondaryBackgroundColor).
+# backgroundColor와 30% 섞이면 위 COLOR_TABLE_HOVER가 나옵니다.
+COLOR_TABLE_HOVER_SOURCE = "#7D6244"
+
+# 표 글씨 굵기. Streamlit은 열 헤더 굵기를 따로 받지 않고 테마의 기본 글씨
+# 굵기(baseFontWeight)를 쓰므로, 헤더를 굵게 하려면 이 값을 올려야 합니다.
+TABLE_FONT_WEIGHT = 600
+
+# 표 밖(사이트 본문)에서 되돌릴 보통 굵기와 강조 굵기.
+BODY_FONT_WEIGHT = 400
+BODY_STRONG_FONT_WEIGHT = 700
+
+# Hero 배경으로 쓸 이미지. 없어도 앱은 그대로 동작합니다(아래 fallback 사용).
+HERO_IMAGE_PATH = Path(__file__).parent / "assets" / "wall_street_hero.jpg"
+
+# Hero 배경으로 쓸 이미지 크기(픽셀)와 JPEG 품질.
+# 원본이 크면 화면을 다시 그릴 때마다 큰 데이터를 실어 보내게 되므로,
+# 가로로 긴 Hero 영역에 필요한 만큼만 잘라 줄여서 씁니다.
+# 처리에 실패하면 원본을 그대로 쓰므로 어느 쪽이든 배경은 표시됩니다.
+HERO_IMAGE_MAX_WIDTH = 1600
+HERO_IMAGE_MAX_HEIGHT = 480
+HERO_IMAGE_JPEG_QUALITY = 72
+
+# 세로로 긴 사진을 자를 때 남길 위치(0=위쪽, 1=아래쪽).
+# 건물 사이가 잘 보이도록 살짝 위쪽을 남깁니다.
+HERO_IMAGE_FOCAL_Y = 0.38
+
+# 이미지 위에 덮는 밝은 베이지 오버레이(검정 오버레이를 쓰지 않습니다).
+# 건물 사진은 분위기만 남기고, 글자가 가장 선명하게 보이도록 합니다.
+HERO_OVERLAY = (
+    "linear-gradient(100deg,"
+    " rgba(212, 207, 194, 0.94) 0%,"
+    " rgba(212, 207, 194, 0.88) 46%,"
+    " rgba(212, 207, 194, 0.78) 100%)"
+)
+
+# 이미지의 채도·대비를 낮춰 배경으로 물러나게 합니다.
+HERO_IMAGE_FILTER = "grayscale(0.22) saturate(0.55) brightness(1.06)"
+
+# 이미지 파일이 없거나 읽지 못했을 때 쓰는 절제된 그라데이션.
+# 지정 컬러(#D4CFC2, #00533E)만으로 구성합니다.
+HERO_FALLBACK_BACKGROUND = (
+    "linear-gradient(118deg,"
+    " #D4CFC2 0%,"
+    " rgba(0, 83, 62, 0.18) 52%,"
+    " rgba(0, 83, 62, 0.42) 100%)"
+)
+
+# Hero 안에 넣을 문구.
+HERO_EYEBROW = "SEC 13F INTELLIGENCE PLATFORM"
+HERO_TITLE = "AI 13F Portfolio Analysis"
+HERO_SUBTITLE = (
+    "Analyze institutional filings, portfolio changes, and comparative "
+    "positioning with AI-assisted insights."
+)
+# 영문 보조 설명 아래에 덧붙이는 한 줄 설명.
+# 이 프로젝트를 처음 보는 사용자가 '13F'가 무엇인지 바로 알 수 있게 합니다.
+HERO_DESCRIPTION = (
+    "13F는 미국 기관투자자가 SEC에 분기별로 제출하는 보유 주식 공시입니다."
+)
+
+# 기존 'PoC' 표현은 메인 제목이 아니라 작은 보조 텍스트로만 남깁니다.
+HERO_NOTE = "SEC EDGAR 13F-HR 공시 기반 PoC"
+
+# AI 브리핑 결과를 감싸는 카드의 제목과 컨테이너 key.
+# key를 주면 Streamlit이 그 컨테이너에 `st-key-<key>` 클래스를 붙여 주므로,
+# 버전마다 바뀌는 자동 생성 클래스에 기대지 않고 카드 하나만 골라 꾸밀 수 있습니다.
+# (위젯 key가 아니라 표시용 컨테이너 key라 화면 상태(session_state)에는 영향이 없습니다.)
+AI_BRIEFING_CARD_TITLE = "AI 브리핑"
+AI_BRIEFING_CARD_KEY = "ai_briefing_card"
+INSTITUTION_AI_BRIEFING_CARD_KEY = "institution_ai_briefing_card"
+
+# 본문이 지나치게 넓어지지 않도록 제한하는 폭(픽셀).
+# layout="wide"로 화면은 넓게 쓰되, 표와 글은 읽기 좋은 폭을 유지합니다.
+CONTENT_MAX_WIDTH = 1180
+
+
+def rgb_triplet(hex_color: str) -> str:
+    """'#00533E' 같은 값을 CSS rgba()에 넣을 '0, 83, 62' 형태로 바꿉니다."""
+    value = hex_color.lstrip("#")
+    return ", ".join(str(int(value[index : index + 2], 16)) for index in (0, 2, 4))
+
+
+def theme_variables_css() -> str:
+    """위에서 정한 여섯 가지 컬러를 CSS 변수로 선언합니다.
+
+    색을 한 곳(위 상수)에서만 관리하기 위해, 아래 스타일시트는 색을 직접
+    적지 않고 이 변수만 참조합니다.
+    """
+    return (
+        ":root{"
+        f"--f13-bg: {COLOR_BACKGROUND};"
+        f"--f13-bg-rgb: {rgb_triplet(COLOR_BACKGROUND)};"
+        f"--f13-heading: {COLOR_HEADING};"
+        f"--f13-heading-rgb: {rgb_triplet(COLOR_HEADING)};"
+        f"--f13-body: {COLOR_BODY};"
+        f"--f13-accent: {COLOR_ACCENT};"
+        f"--f13-accent-rgb: {rgb_triplet(COLOR_ACCENT)};"
+        f"--f13-secondary: {COLOR_SECONDARY};"
+        f"--f13-secondary-rgb: {rgb_triplet(COLOR_SECONDARY)};"
+        f"--f13-badge: {COLOR_BADGE};"
+        f"--f13-badge-rgb: {rgb_triplet(COLOR_BADGE)};"
+        f"--f13-table-header-bg: {COLOR_TABLE_HEADER_BG};"
+        f"--f13-table-bg: {COLOR_TABLE_BG};"
+        f"--f13-table-text: {COLOR_TABLE_TEXT};"
+        f"--f13-table-muted: {COLOR_TABLE_MUTED_TEXT};"
+        f"--f13-table-border: {COLOR_TABLE_BORDER};"
+        f"--f13-table-hover: {COLOR_TABLE_HOVER};"
+        f"--f13-body-weight: {BODY_FONT_WEIGHT};"
+        f"--f13-strong-weight: {BODY_STRONG_FONT_WEIGHT};"
+        f"--f13-content-width: {CONTENT_MAX_WIDTH}px;"
+        "}"
+    )
+
+
+# 화면 전체에 적용할 스타일시트.
+# 색은 위 theme_variables_css()가 선언한 변수만 씁니다.
+# Streamlit 내부 클래스 이름은 버전마다 달라지므로 data-testid를 기준으로 잡습니다.
+PAGE_STYLE_CSS = """
+/* ── 바탕색 통일 ─────────────────────────────────────────────────────── */
+/* 상단 영역(stHeader)과 본문(stMain)이 서로 다른 색으로 보이지 않게 합니다.
+   테마 자체는 표를 어둡게 그리려고 다크로 잡아 두었으므로(.streamlit/config.toml),
+   화면에 보이는 부분은 여기서 전부 밝은 베이지로 다시 칠합니다. */
+body,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="stHeader"],
+[data-testid="stSidebar"],
+[data-testid="stBottom"] > div {
+    background-color: var(--f13-bg);
+    background-image: none;
+}
+
+[data-testid="stHeader"] {
+    border-bottom: none;
+    box-shadow: none;
+}
+
+[data-testid="stToolbar"] {
+    background: transparent;
+}
+
+/* 화면은 넓게 쓰되, 글과 표는 읽기 좋은 폭 안에 둡니다. */
+[data-testid="stMainBlockContainer"] {
+    max-width: var(--f13-content-width);
+    padding-top: 2.4rem;
+    padding-bottom: 4rem;
+}
+
+/* ── 글자색 ──────────────────────────────────────────────────────────── */
+[data-testid="stAppViewContainer"] {
+    color: var(--f13-body);
+}
+
+[data-testid="stMarkdown"] p,
+[data-testid="stMarkdown"] li,
+[data-testid="stMarkdown"] strong,
+[data-testid="stWidgetLabel"] p,
+label p {
+    color: var(--f13-body);
+}
+
+/* 섹션 제목은 짙은 녹색. 한글 가독성을 위해 본문 글꼴(sans-serif)을 유지합니다. */
+[data-testid="stHeading"] h1,
+[data-testid="stHeading"] h2,
+[data-testid="stHeading"] h3,
+[data-testid="stHeading"] h4,
+[data-testid="stHeading"] h5,
+[data-testid="stHeading"] h6 {
+    color: var(--f13-heading);
+    letter-spacing: -0.01em;
+}
+
+/* 설명 캡션은 본문보다 한 단계 옅은 검정으로 둡니다. */
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p {
+    color: rgba(0, 0, 0, 0.72);
+}
+
+/* 본문에 섞인 링크와 코드 조각(AI 브리핑 Markdown 등).
+   다크 테마 기본색(밝은 파랑·초록)이 베이지 배경에서 흐려지지 않도록 고정합니다. */
+[data-testid="stMarkdown"] a,
+[data-testid="stAlertContainer"] a {
+    color: var(--f13-secondary);
+}
+
+[data-testid="stMarkdown"] code,
+[data-testid="stAlertContainer"] code {
+    background-color: rgba(var(--f13-badge-rgb), 0.35);
+    color: var(--f13-body);
+}
+
+/* ── 글자 굵기 ───────────────────────────────────────────────────────── */
+/* 표(canvas) 헤더를 굵게 그리려면 테마의 baseFontWeight를 올려야 하는데,
+   그 값은 화면 전체 글씨에도 함께 걸립니다. 표 밖의 글은 예전처럼 보통
+   굵기로 보이도록 여기서 되돌립니다(표 안 글씨는 CSS가 닿지 않아 그대로 굵게). */
+body,
+[data-testid="stAppViewContainer"],
+[data-testid="stMarkdown"] p,
+[data-testid="stMarkdown"] li,
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p,
+[data-testid="stAlertContainer"],
+[data-testid="stAlertContainer"] p,
+[data-testid="stAlertContainer"] li,
+[data-testid="stWidgetLabel"] p,
+label p {
+    font-weight: var(--f13-body-weight);
+}
+
+[data-testid="stMarkdown"] strong,
+[data-testid="stAlertContainer"] strong {
+    font-weight: var(--f13-strong-weight);
+}
+
+/* 구분선은 금융 저널처럼 얇은 한 줄로. */
+[data-testid="stMain"] hr {
+    border: none;
+    border-top: 1px solid rgba(var(--f13-heading-rgb), 0.25);
+    margin: 2rem 0 1.6rem;
+}
+
+/* ── 버튼 ────────────────────────────────────────────────────────────── */
+/* key, callback, disabled 조건은 파이썬 쪽 그대로이고 색만 바꿉니다. */
+/* 보조 버튼: 테두리와 hover에 #A35D3F를 쓰고, 글자는 대비가 높은 검정으로 둡니다.
+   (베이지 배경 위 갈색 글씨는 명도 대비가 3.2:1로 낮아 읽기 어렵습니다.) */
+.stButton > button,
+[data-testid="stBaseButton-secondary"] {
+    background-color: transparent;
+    color: var(--f13-body);
+    border: 1px solid rgba(var(--f13-secondary-rgb), 0.65);
+    border-radius: 2px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    box-shadow: none;
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.stButton > button:hover,
+.stButton > button:focus-visible,
+[data-testid="stBaseButton-secondary"]:hover,
+[data-testid="stBaseButton-secondary"]:focus-visible {
+    background-color: var(--f13-secondary);
+    color: #FFFFFF;
+    border-color: var(--f13-secondary);
+}
+
+/* 주요 실행 버튼(type="primary"). 주황 바탕 위 검정 글씨로 대비를 확보합니다. */
+.stButton > button[kind="primary"],
+[data-testid="stBaseButton-primary"] {
+    background-color: var(--f13-accent);
+    color: var(--f13-body);
+    border: 1px solid rgba(var(--f13-secondary-rgb), 0.55);
+    font-weight: 700;
+}
+
+.stButton > button[kind="primary"]:hover,
+.stButton > button[kind="primary"]:focus-visible,
+[data-testid="stBaseButton-primary"]:hover,
+[data-testid="stBaseButton-primary"]:focus-visible {
+    background-color: var(--f13-secondary);
+    color: #FFFFFF;
+    border-color: var(--f13-secondary);
+}
+
+.stButton > button:disabled,
+.stButton > button:disabled:hover {
+    background-color: transparent;
+    color: rgba(0, 0, 0, 0.35);
+    border-color: rgba(0, 0, 0, 0.2);
+}
+
+/* ── 선택 상자 ───────────────────────────────────────────────────────── */
+/* 화면 안의 모든 st.selectbox(분석 대상, 공시 조회, 보유 종목, 동일 분기 비교 등)에
+   같은 규칙이 걸리도록 위젯 종류(data-testid)로만 잡습니다.
+   오른쪽 화살표를 흰색으로 두기 위해, 상자 자체를 짙은 녹색 바탕으로 바꿔
+   글자·화살표가 배경과 충분한 대비를 갖게 했습니다. */
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div {
+    background-color: var(--f13-heading);
+    border: 1px solid rgba(var(--f13-heading-rgb), 0.9);
+    border-radius: 2px;
+    color: #FFFFFF;
+}
+
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div:focus-within {
+    border-color: var(--f13-accent);
+    box-shadow: none;
+}
+
+/* 선택된 값과 placeholder(값을 고르기 전 안내 글) 모두 흰색으로 둡니다. */
+[data-testid="stSelectbox"] div[data-baseweb="select"],
+[data-testid="stSelectbox"] div[data-baseweb="select"] div,
+[data-testid="stSelectbox"] div[data-baseweb="select"] span,
+[data-testid="stSelectbox"] div[data-baseweb="select"] input {
+    color: #FFFFFF;
+    -webkit-text-fill-color: #FFFFFF;
+}
+
+/* 오른쪽 드롭다운 화살표(BaseWeb select 안의 svg 아이콘).
+   아이콘이 currentColor를 쓰는 경우와 fill을 직접 쓰는 경우가 모두 있어
+   color와 fill을 함께 지정합니다. */
+[data-testid="stSelectbox"] svg,
+[data-testid="stSelectbox"] div[data-baseweb="select"] svg,
+[data-testid="stSelectbox"] div[data-baseweb="select"] svg *,
+[data-testid="stSelectbox"] div[data-baseweb="select"] [data-baseweb="icon"] svg,
+[data-testid="stSelectbox"] div[data-baseweb="select"] [aria-hidden="true"] svg {
+    color: #FFFFFF;
+    fill: #FFFFFF;
+}
+
+/* 펼쳐진 목록은 화면 밖(포털)에 그려지므로 따로 색을 맞춰 줍니다. */
+div[data-baseweb="popover"] ul[role="listbox"] {
+    background-color: var(--f13-bg);
+    border: 1px solid rgba(var(--f13-heading-rgb), 0.3);
+}
+
+div[data-baseweb="popover"] li[role="option"] {
+    background-color: transparent;
+    color: var(--f13-body);
+}
+
+div[data-baseweb="popover"] li[role="option"]:hover,
+div[data-baseweb="popover"] li[role="option"][aria-selected="true"] {
+    background-color: rgba(var(--f13-badge-rgb), 0.55);
+    color: var(--f13-body);
+}
+
+/* ── 탭 ──────────────────────────────────────────────────────────────── */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    background-color: transparent;
+    border-bottom: 1px solid rgba(var(--f13-heading-rgb), 0.25);
+    gap: 0.25rem;
+}
+
+[data-testid="stTab"] {
+    color: rgba(0, 0, 0, 0.68);
+    font-weight: 600;
+}
+
+[data-testid="stTab"]:hover {
+    color: var(--f13-secondary);
+}
+
+[data-testid="stTab"][aria-selected="true"] {
+    color: var(--f13-heading);
+    background-color: rgba(var(--f13-badge-rgb), 0.32);
+}
+
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+    background-color: var(--f13-accent);
+}
+
+[data-testid="stTabs"] [data-baseweb="tab-border"] {
+    background-color: transparent;
+}
+
+/* ── 지표 카드 ───────────────────────────────────────────────────────── */
+[data-testid="stMetric"] {
+    background-color: rgba(var(--f13-badge-rgb), 0.14);
+    border: 1px solid rgba(var(--f13-heading-rgb), 0.2);
+    border-left: 3px solid var(--f13-badge);
+    border-radius: 2px;
+    padding: 0.85rem 1rem;
+}
+
+[data-testid="stMetricLabel"] p {
+    color: rgba(0, 0, 0, 0.75);
+    font-weight: 600;
+}
+
+[data-testid="stMetricValue"] {
+    color: var(--f13-heading);
+}
+
+/* ── 표(검은색 기반 다크 테이블) ─────────────────────────────────────── */
+/* 사이트 배경은 밝은 베이지지만, 표만은 검정 기반 다크 테이블로 둡니다.
+   st.dataframe의 열 헤더와 칸은 <canvas>(그림판)에 그려져 CSS가 닿지 않으므로,
+   그 색은 .streamlit/config.toml의 [theme]에 같은 값으로 적어 두었습니다.
+   여기서는 표를 감싸는 상자, 도구 모음, 그리고 HTML로 그려지는 표를 맞춥니다. */
+[data-testid="stDataFrame"] {
+    background-color: var(--f13-table-bg);
+    border: 1px solid var(--f13-table-border);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+/* 표 위에 떠 있는 도구 모음(검색·다운로드·전체화면)도 어두운 표에 맞춥니다.
+   밝은 배경에 검은 아이콘을 두면 어두운 표 위에서 보이지 않게 됩니다. */
+[data-testid="stElementToolbar"] {
+    background-color: var(--f13-table-header-bg);
+    border: 1px solid var(--f13-table-border);
+    border-radius: 2px;
+}
+
+[data-testid="stElementToolbar"] button,
+[data-testid="stElementToolbar"] button svg,
+[data-testid="stElementToolbar"] button svg * {
+    color: var(--f13-table-text);
+    fill: var(--f13-table-text);
+}
+
+[data-testid="stElementToolbar"] button:hover {
+    background-color: rgba(var(--f13-badge-rgb), 0.22);
+}
+
+/* st.table과 Markdown 표(AI 브리핑이 표를 만들어 낼 때)에는 CSS가 그대로
+   적용되므로, st.dataframe과 같은 다크 테이블로 맞춥니다. */
+[data-testid="stTable"] table,
+[data-testid="stMarkdown"] table {
+    border-collapse: collapse;
+    background-color: var(--f13-table-bg);
+    color: var(--f13-table-text);
+    overflow: hidden;
+}
+
+[data-testid="stTable"] thead th,
+[data-testid="stMarkdown"] thead th {
+    background-color: var(--f13-table-header-bg);
+    color: var(--f13-table-text);
+    font-weight: 600;
+    border-bottom: 1px solid var(--f13-table-border);
+    border-right: 1px solid var(--f13-table-border);
+}
+
+[data-testid="stTable"] tbody td,
+[data-testid="stTable"] tbody th,
+[data-testid="stMarkdown"] tbody td,
+[data-testid="stMarkdown"] tbody th {
+    background-color: var(--f13-table-bg);
+    color: var(--f13-table-text);
+    border-bottom: 1px solid var(--f13-table-border);
+    border-right: 1px solid var(--f13-table-border);
+}
+
+/* 표 안의 보조 텍스트는 어두운 회색 대신 밝은 베이지로 두어 대비를 높입니다. */
+[data-testid="stTable"] tbody th,
+[data-testid="stMarkdown"] tbody th,
+[data-testid="stTable"] caption,
+[data-testid="stMarkdown"] caption {
+    color: var(--f13-table-muted);
+}
+
+[data-testid="stTable"] tbody tr:hover td,
+[data-testid="stTable"] tbody tr:hover th,
+[data-testid="stMarkdown"] tbody tr:hover td,
+[data-testid="stMarkdown"] tbody tr:hover th {
+    background-color: var(--f13-table-hover);
+}
+
+/* ── AI 브리핑 카드 ──────────────────────────────────────────────────── */
+/* st.container(border=True, key=...)가 붙여 주는 `st-key-<key>` 클래스로
+   해당 컨테이너 하나만 골라 꾸밉니다. 단일 기관 브리핑과 기관 비교 브리핑이
+   같은 규칙을 공유하므로 두 카드의 모양이 항상 같습니다. */
+.st-key-ai_briefing_card,
+.st-key-institution_ai_briefing_card {
+    background-color: rgba(var(--f13-badge-rgb), 0.2);
+    border: 1px solid var(--f13-secondary);
+    border-radius: 2px;
+    box-shadow: none;
+    padding: 1.3rem 1.5rem 1.1rem;
+    margin: 0.4rem 0 0.6rem;
+}
+
+.f13-briefing-card__title {
+    margin: 0 0 0.9rem;
+    padding-bottom: 0.55rem;
+    border-bottom: 1px solid rgba(var(--f13-secondary-rgb), 0.45);
+    color: var(--f13-heading);
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+}
+
+/* 카드 안의 본문은 검정으로, 문단 사이는 조금 넉넉하게 둡니다.
+   (AI 응답의 Markdown 형식은 그대로 두고 색과 여백만 정합니다.) */
+.st-key-ai_briefing_card [data-testid="stMarkdown"] p,
+.st-key-ai_briefing_card [data-testid="stMarkdown"] li,
+.st-key-ai_briefing_card [data-testid="stMarkdown"] strong,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] p,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] li,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] strong {
+    color: var(--f13-body);
+    line-height: 1.75;
+}
+
+.st-key-ai_briefing_card [data-testid="stMarkdown"] p,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] p {
+    margin-bottom: 0.85rem;
+}
+
+.st-key-ai_briefing_card [data-testid="stMarkdown"] h1,
+.st-key-ai_briefing_card [data-testid="stMarkdown"] h2,
+.st-key-ai_briefing_card [data-testid="stMarkdown"] h3,
+.st-key-ai_briefing_card [data-testid="stMarkdown"] h4,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] h1,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] h2,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] h3,
+.st-key-institution_ai_briefing_card [data-testid="stMarkdown"] h4 {
+    color: var(--f13-heading);
+    margin-top: 1.1rem;
+}
+
+/* ── 안내·경고·오류 상자 ─────────────────────────────────────────────── */
+/* Streamlit 기본색(파랑 등) 대신 지정 컬러만 쓰되, 종류별 구분은 유지합니다. */
+[data-testid="stAlertContainer"] {
+    border-radius: 2px;
+    color: var(--f13-body);
+}
+
+[data-testid="stAlertContainer"] p,
+[data-testid="stAlertContainer"] li,
+[data-testid="stAlertContainer"] strong {
+    color: var(--f13-body);
+}
+
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {
+    background-color: rgba(var(--f13-secondary-rgb), 0.1);
+    border-left: 4px solid var(--f13-secondary);
+}
+
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {
+    background-color: rgba(var(--f13-heading-rgb), 0.12);
+    border-left: 4px solid var(--f13-heading);
+}
+
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {
+    background-color: rgba(var(--f13-badge-rgb), 0.35);
+    border-left: 4px solid var(--f13-badge);
+}
+
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {
+    background-color: rgba(var(--f13-accent-rgb), 0.16);
+    border-left: 4px solid var(--f13-accent);
+}
+
+/* ── 진행 표시와 상단 도구 ───────────────────────────────────────────── */
+/* 테마가 다크라 기본 글자·아이콘이 흰색으로 나옵니다. 베이지 배경 위에서
+   보이지 않는 일이 없도록 본문 색으로 되돌립니다. */
+[data-testid="stSpinner"],
+[data-testid="stSpinner"] p,
+[data-testid="stSpinner"] span,
+[data-testid="stSpinner"] svg,
+[data-testid="stStatusWidget"],
+[data-testid="stStatusWidget"] label,
+[data-testid="stToolbar"] button,
+[data-testid="stToolbar"] svg,
+[data-testid="stMainMenu"] svg {
+    color: var(--f13-body);
+    fill: currentColor;
+}
+
+/* ── Hero 영역 ───────────────────────────────────────────────────────── */
+.f13-hero {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    min-height: 360px;
+    display: flex;
+    align-items: center;
+    margin: 0 0 2.2rem;
+    padding: 3rem clamp(1.5rem, 4vw, 3.5rem);
+    border: 1px solid rgba(var(--f13-heading-rgb), 0.28);
+    border-radius: 2px;
+}
+
+/* 배경 이미지(또는 fallback 그라데이션). Hero 안에서만 씁니다. */
+.f13-hero::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    background-position: center 38%;
+    background-repeat: no-repeat;
+    background-size: cover;
+}
+
+/* 이미지 위에 덮는 밝은 베이지 오버레이. 글자가 가장 선명하게 보이도록 합니다. */
+.f13-hero::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background: var(--f13-hero-overlay);
+}
+
+.f13-hero__inner {
+    position: relative;
+    z-index: 2;
+    max-width: 44rem;
+}
+
+.f13-hero__eyebrow {
+    margin: 0 0 1rem;
+    color: var(--f13-secondary);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+}
+
+.f13-hero__title {
+    margin: 0 0 1.1rem;
+    color: var(--f13-heading);
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: clamp(2.4rem, 5vw, 4.25rem);
+    font-weight: 700;
+    line-height: 1.04;
+    letter-spacing: -0.02em;
+}
+
+.f13-hero__subtitle {
+    margin: 0 0 1.4rem;
+    max-width: 34rem;
+    color: var(--f13-body);
+    font-size: clamp(0.98rem, 1.2vw, 1.12rem);
+    line-height: 1.6;
+}
+
+/* 영문 보조 설명 아래 한 줄 설명. 강조하지 않고 보조 설명보다 작게 둡니다. */
+.f13-hero__desc {
+    margin: 0 0 1.4rem;
+    max-width: 34rem;
+    color: var(--f13-body);
+    font-size: 0.86rem;
+    line-height: 1.55;
+}
+
+.f13-hero__note {
+    display: inline-block;
+    margin: 0;
+    padding: 0.34rem 0.7rem;
+    background-color: var(--f13-badge);
+    color: var(--f13-body);
+    border-radius: 2px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+}
+"""
+
+
+@st.cache_data(show_spinner=False)
+def hero_image_data_uri(image_path: str) -> str:
+    """Hero 배경 이미지를 읽어 CSS에 바로 넣을 수 있는 data URI로 만듭니다.
+
+    외부 주소를 쓰지 않고 저장소 안의 파일만 읽습니다. 파일이 없거나 읽지
+    못하면 빈 문자열을 돌려주어, 부르는 쪽이 fallback 배경을 쓰게 합니다.
+    (읽기에 실패해도 예외를 밖으로 내보내지 않으므로 앱이 멈추지 않습니다.)
+    """
+    try:
+        raw_image = Path(image_path).read_bytes()
+    except OSError:
+        return ""
+
+    if not raw_image:
+        return ""
+
+    return "data:image/jpeg;base64," + base64.b64encode(
+        compact_hero_image(raw_image)
+    ).decode("ascii")
+
+
+def compact_hero_image(raw_image: bytes) -> bytes:
+    """가로로 긴 Hero 영역에 필요한 만큼만 이미지를 잘라 줄입니다.
+
+    원본이 크면 화면을 다시 그릴 때마다 큰 데이터를 함께 보내게 되어 느려집니다.
+    줄이는 데 실패하면(라이브러리가 없거나 형식이 달라도) 원본을 그대로 씁니다.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(raw_image)) as image:
+            hero_ratio = HERO_IMAGE_MAX_WIDTH / HERO_IMAGE_MAX_HEIGHT
+            width, height = image.size
+
+            if width / height > hero_ratio:
+                # 가로가 더 긴 사진: 좌우를 잘라 냅니다(가운데 기준).
+                kept_width = max(1, round(height * hero_ratio))
+                left = round((width - kept_width) / 2)
+                box = (left, 0, left + kept_width, height)
+            else:
+                # 세로가 더 긴 사진: 위아래를 잘라 냅니다(위쪽을 조금 더 남김).
+                kept_height = max(1, round(width / hero_ratio))
+                top = round((height - kept_height) * HERO_IMAGE_FOCAL_Y)
+                box = (0, top, width, top + kept_height)
+
+            cropped = image.convert("RGB").crop(box)
+            resized = cropped.resize((HERO_IMAGE_MAX_WIDTH, HERO_IMAGE_MAX_HEIGHT))
+
+            buffer = BytesIO()
+            resized.save(
+                buffer,
+                format="JPEG",
+                quality=HERO_IMAGE_JPEG_QUALITY,
+                optimize=True,
+            )
+            return buffer.getvalue()
+    except Exception:
+        # 이미지 처리에 실패해도 배경은 보여야 하므로 원본을 그대로 돌려줍니다.
+        return raw_image
+
+
+def hero_background_css(image_path=None) -> str:
+    """Hero의 배경 이미지(또는 fallback)를 정하는 CSS 조각을 만듭니다.
+
+    이미지가 있으면 채도·대비를 낮춰 배경으로 물러나게 하고,
+    없으면 #D4CFC2와 #00533E만 쓴 절제된 그라데이션을 씁니다.
+    """
+    data_uri = hero_image_data_uri(str(image_path or HERO_IMAGE_PATH))
+
+    if not data_uri:
+        return (
+            ".f13-hero::before{"
+            f"background-image: {HERO_FALLBACK_BACKGROUND};"
+            "filter: none;"
+            "}"
+        )
+
+    return (
+        ".f13-hero::before{"
+        f'background-image: url("{data_uri}");'
+        f"filter: {HERO_IMAGE_FILTER};"
+        "}"
+    )
+
+
+def hero_overlay_css() -> str:
+    """이미지 위에 덮을 밝은 베이지 오버레이를 CSS 변수로 넘깁니다."""
+    return f":root{{--f13-hero-overlay: {HERO_OVERLAY};}}"
+
+
+def hero_html() -> str:
+    """Hero 영역의 HTML을 만듭니다(문구는 위 상수 그대로)."""
+    return (
+        '<div class="f13-hero">'
+        '<div class="f13-hero__inner">'
+        f'<p class="f13-hero__eyebrow">{HERO_EYEBROW}</p>'
+        f'<h1 class="f13-hero__title">{HERO_TITLE}</h1>'
+        f'<p class="f13-hero__subtitle">{HERO_SUBTITLE}</p>'
+        f'<p class="f13-hero__desc">{HERO_DESCRIPTION}</p>'
+        f'<p class="f13-hero__note">{HERO_NOTE}</p>'
+        "</div>"
+        "</div>"
+    )
+
+
+def apply_page_style(image_path=None) -> None:
+    """컬러 시스템과 Hero 배경 스타일을 화면에 적용합니다(표시 전용)."""
+    st.markdown(
+        "<style>"
+        + theme_variables_css()
+        + hero_overlay_css()
+        + PAGE_STYLE_CSS
+        + hero_background_css(image_path)
+        + "</style>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_hero() -> None:
+    """페이지 최상단 Hero 영역을 그립니다(기존 st.title을 대신합니다)."""
+    st.markdown(hero_html(), unsafe_allow_html=True)
+
+
+def render_ai_briefing_card(briefing_text: str, container_key: str) -> None:
+    """AI 브리핑 결과를 테두리가 있는 카드 하나로 묶어 보여 줍니다(표시 전용).
+
+    브리핑의 시작과 끝이 눈에 보이도록 st.container(border=True) 안에 제목과
+    본문을 함께 넣습니다. 본문은 st.markdown으로 그대로 그리므로 Gemini가
+    만든 Markdown 형식(제목, 목록, 굵은 글씨)이 그대로 유지됩니다.
+
+    Args:
+        briefing_text: 화면 상태에 담아 둔 AI 브리핑 본문(Markdown).
+        container_key: 카드에 붙일 컨테이너 key. 이 값으로 CSS 클래스
+            `st-key-<container_key>`가 만들어져 카드 모양이 정해집니다.
+    """
+    with st.container(border=True, key=container_key):
+        st.markdown(
+            f'<p class="f13-briefing-card__title">{AI_BRIEFING_CARD_TITLE}</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(briefing_text)
 
 
 @st.cache_data
@@ -913,16 +1745,43 @@ def weight_change_chart(chart_data: pd.DataFrame) -> alt.Chart:
         .encode(x="zero:Q")
     )
 
-    return (bars + zero_line).properties(height=alt.Step(26))
+    # 축·범례 색을 못 박습니다(표를 다크로 만들려고 테마를 어둡게 잡았기 때문에,
+    # 그냥 두면 차트 글씨가 흰색으로 그려져 베이지 배경에서 보이지 않습니다).
+    return (
+        (bars + zero_line)
+        .properties(height=alt.Step(26))
+        .configure(background="transparent")
+        .configure_view(stroke=None)
+        .configure_axis(
+            labelColor=CHART_LABEL_COLOR,
+            titleColor=CHART_LABEL_COLOR,
+            gridColor=CHART_GRID_COLOR,
+            domainColor=CHART_GRID_COLOR,
+        )
+        .configure_legend(
+            labelColor=CHART_LABEL_COLOR,
+            titleColor=CHART_LABEL_COLOR,
+        )
+        .configure_title(color=COLOR_HEADING)
+    )
 
 
 # ---------------------------------------------------------------------------
 # 화면 구성
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="AI 13F 포트폴리오 분석 PoC", page_icon="📊")
+st.set_page_config(
+    page_title="AI 13F 포트폴리오 분석 PoC",
+    page_icon="📊",
+    layout="wide",
+)
 
-st.title("📊 AI 13F 포트폴리오 분석 PoC")
+# 컬러 시스템과 Hero 스타일 적용. 화면에 보이는 모습만 바꾸며,
+# 아래 분석 기능의 실행 순서나 조건은 건드리지 않습니다.
+apply_page_style()
+
+# 기존 st.title을 대신하는 Hero 영역(제목이 중복되지 않게 title은 쓰지 않습니다).
+render_hero()
 
 st.subheader("프로젝트 설명")
 st.write(
@@ -1436,7 +2295,9 @@ else:
             "AI 생성 결과는 투자 권유가 아니며 제공된 13F 분석 데이터만 요약합니다. "
             "내용에 사실과 다른 부분이 있을 수 있으니 위의 표와 숫자를 함께 확인해 주세요."
         )
-        st.markdown(st.session_state["ai_briefing"])
+        render_ai_briefing_card(
+            st.session_state["ai_briefing"], AI_BRIEFING_CARD_KEY
+        )
 
 st.divider()
 
@@ -1832,7 +2693,10 @@ if left_institution is not None and right_institution is not None:
                         "설명합니다. 내용에 사실과 다른 부분이 있을 수 있으니 위의 "
                         "표와 숫자를 함께 확인해 주세요."
                     )
-                    st.markdown(st.session_state["institution_ai_briefing"])
+                    render_ai_briefing_card(
+                        st.session_state["institution_ai_briefing"],
+                        INSTITUTION_AI_BRIEFING_CARD_KEY,
+                    )
 
 st.divider()
 
