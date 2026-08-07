@@ -1,0 +1,49 @@
+# Streamlit 화면 테마 설정 (보이는 모습만 정합니다).
+#
+# 이 파일이 필요한 이유:
+#   st.dataframe의 열 헤더와 칸은 HTML이 아니라 <canvas>(그림판)에 그려집니다.
+#   그래서 CSS로는 표의 배경이나 글자색을 바꿀 수 없고, Streamlit이 공식적으로
+#   지원하는 아래 [theme] 설정으로만 정할 수 있습니다.
+#
+#   표를 '검은색 기반 다크 테이블'로 만들려면 테마의 배경·글자색 자체를 어둡게
+#   잡아야 합니다. 대신 사이트 화면(HTML 부분)은 streamlit_app.py의 CSS가
+#   전부 다시 칠하므로, 배경 #D4CFC2 · 제목 #00533E · 본문 검정은 그대로입니다.
+#
+#   아래 색·굵기 값은 streamlit_app.py 위쪽의 COLOR_TABLE_* / TABLE_FONT_WEIGHT
+#   상수와 같은 값이어야 하며, 어긋나면 테스트가 실패합니다.
+#
+# 비밀 정보는 이 파일에 넣지 않습니다. API 키·연락처 등은 secrets.toml에서만 읽습니다.
+
+[theme]
+# 어두운 테마로 고정합니다. 브라우저가 밝은 모드여도 표는 항상 다크로 그려집니다.
+base = "dark"
+
+# 주요 실행 버튼과 활성 상태(사이트 강조색 그대로).
+# 표 안에서는 비중 막대(ProgressColumn)와 선택 표시 색으로도 쓰입니다.
+primaryColor = "#F7633D"
+
+# 표 본문 칸의 배경(매우 어두운 차콜).
+# 사이트 배경으로도 쓰이지만, streamlit_app.py의 CSS가 #D4CFC2로 덮어씁니다.
+backgroundColor = "#0F0F0F"
+
+# 표에서 행 위에 마우스를 올렸을 때 색을 만드는 재료입니다.
+# Streamlit은 hover 색을 backgroundColor와 이 값을 30% 섞어 만들기 때문에,
+# 결과가 #ECB97A를 아주 옅게 얹은 #30281F가 되도록 역산한 값입니다.
+secondaryBackgroundColor = "#7D6244"
+
+# 표 본문 글씨(흰색). 사이트 본문 글씨는 CSS가 검정으로 되돌립니다.
+textColor = "#FFFFFF"
+
+# 표 열 헤더 배경(검정).
+dataframeHeaderBackgroundColor = "#000000"
+
+# 표의 행·열 구분선. #A35D3F를 어두운 표 배경 위에 옅게 얹은 값입니다.
+dataframeBorderColor = "#593627"
+
+# 표 글씨 굵기. Streamlit은 열 헤더 글씨 굵기를 따로 받지 않고 이 값을 쓰므로,
+# 헤더를 600으로 만들려면 여기서 올려야 합니다.
+# 표 밖의 글씨는 streamlit_app.py의 CSS가 보통 굵기(400)로 되돌립니다.
+baseFontWeight = 600
+
+# 모서리를 과하게 둥글리지 않습니다.
+baseRadius = "none"
